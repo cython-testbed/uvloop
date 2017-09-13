@@ -22,6 +22,7 @@ branches:
         - master
         - ci
         - releases
+        - /^v\d+(\.\d+)*$/
 
 matrix:
     fast_finish: true
@@ -50,7 +51,7 @@ matrix:
           dist: trusty
           sudo: false
           language: python
-          python: "3.6-dev"
+          python: "3.6"
           env: BUILD=tests
 
         - os: linux
