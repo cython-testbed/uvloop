@@ -2,6 +2,7 @@ import asyncio
 import fcntl
 import logging
 import os
+import sys
 import threading
 import time
 import uvloop
@@ -294,6 +295,29 @@ class _TestBase:
             raise ValueError('aaa')
         with self.assertRaisesRegex(ValueError, 'aaa'):
             self.loop.run_until_complete(foo())
+
+    def test_run_until_complete_loop_orphan_future_close_loop(self):
+        if self.implementation == 'asyncio' and sys.version_info < (3, 6, 2):
+            raise unittest.SkipTest('unfixed asyncio')
+
+        class ShowStopper(BaseException):
+            pass
+
+        async def foo(delay):
+            await asyncio.sleep(delay, loop=self.loop)
+
+        def throw():
+            raise ShowStopper
+
+        self.loop.call_soon(throw)
+        try:
+            self.loop.run_until_complete(foo(0.1))
+        except ShowStopper:
+            pass
+
+        # This call fails if run_until_complete does not clean up
+        # done-callback for the previous future.
+        self.loop.run_until_complete(foo(0.2))
 
     def test_debug_slow_callbacks(self):
         logger = logging.getLogger('asyncio')
@@ -599,6 +623,15 @@ class _TestBase:
 
         self.loop.run_until_complete(foo())
         self.loop.run_until_complete(asyncio.sleep(0.01, loop=self.loop))
+
+    def test_inf_wait_for(self):
+        async def foo():
+            await asyncio.sleep(0.1, loop=self.loop)
+            return 123
+        res = self.loop.run_until_complete(
+            asyncio.wait_for(foo(), timeout=float('inf'), loop=self.loop))
+        self.assertEqual(res, 123)
+
 
 class TestBaseUV(_TestBase, UVTestCase):
 

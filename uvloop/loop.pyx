@@ -86,8 +86,14 @@ cdef class Loop:
 
         self._transports = weakref_WeakValueDictionary()
 
+        # Used to keep a reference (and hence keep the fileobj alive)
+        # for as long as its registered by add_reader or add_writer.
+        # This is how the selector module and hence asyncio behaves.
+        self._fd_to_reader_fileobj = {}
+        self._fd_to_writer_fileobj = {}
+
         self._timers = set()
-        self._polls = dict()
+        self._polls = {}
 
         self._recv_buffer_in_use = 0
 
@@ -546,6 +552,31 @@ cdef class Loop:
     cdef _track_transport(self, UVBaseTransport transport):
         self._transports[transport._fileno()] = transport
 
+    cdef _fileobj_to_fd(self, fileobj):
+        """Return a file descriptor from a file object.
+
+        Parameters:
+        fileobj -- file object or file descriptor
+
+        Returns:
+        corresponding file descriptor
+
+        Raises:
+        ValueError if the object is invalid
+        """
+        # Copy of the `selectors._fileobj_to_fd()` function.
+        if isinstance(fileobj, int):
+            fd = fileobj
+        else:
+            try:
+                fd = int(fileobj.fileno())
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError("Invalid file object: "
+                                 "{!r}".format(fileobj)) from None
+        if fd < 0:
+            raise ValueError("Invalid file descriptor: {}".format(fd))
+        return fd
+
     cdef _ensure_fd_no_transport(self, fd):
         cdef UVBaseTransport tr
         try:
@@ -558,11 +589,13 @@ cdef class Loop:
                     'File descriptor {!r} is used by transport {!r}'.format(
                         fd, tr))
 
-    cdef inline _add_reader(self, fd, Handle handle):
+    cdef inline _add_reader(self, fileobj, Handle handle):
         cdef:
             UVPoll poll
 
         self._check_closed()
+        fd = self._fileobj_to_fd(fileobj)
+        self._ensure_fd_no_transport(fd)
 
         try:
             poll = <UVPoll>(self._polls[fd])
@@ -570,14 +603,19 @@ cdef class Loop:
             poll = UVPoll.new(self, fd)
             self._polls[fd] = poll
 
+        self._fd_to_reader_fileobj[fd] = fileobj
         poll.start_reading(handle)
 
-    cdef inline _remove_reader(self, fd):
+    cdef inline _remove_reader(self, fileobj):
         cdef:
             UVPoll poll
 
         if self._closed == 1:
             return False
+
+        fd = self._fileobj_to_fd(fileobj)
+        self._ensure_fd_no_transport(fd)
+        self._fd_to_reader_fileobj.pop(fd, None)
 
         try:
             poll = <UVPoll>(self._polls[fd])
@@ -590,11 +628,13 @@ cdef class Loop:
             poll._close()
         return result
 
-    cdef inline _add_writer(self, fd, Handle handle):
+    cdef inline _add_writer(self, fileobj, Handle handle):
         cdef:
             UVPoll poll
 
         self._check_closed()
+        fd = self._fileobj_to_fd(fileobj)
+        self._ensure_fd_no_transport(fd)
 
         try:
             poll = <UVPoll>(self._polls[fd])
@@ -602,14 +642,19 @@ cdef class Loop:
             poll = UVPoll.new(self, fd)
             self._polls[fd] = poll
 
+        self._fd_to_writer_fileobj[fd] = fileobj
         poll.start_writing(handle)
 
-    cdef inline _remove_writer(self, fd):
+    cdef inline _remove_writer(self, fileobj):
         cdef:
             UVPoll poll
 
         if self._closed == 1:
             return False
+
+        fd = self._fileobj_to_fd(fileobj)
+        self._ensure_fd_no_transport(fd)
+        self._fd_to_writer_fileobj.pop(fd, None)
 
         try:
             poll = <UVPoll>(self._polls[fd])
@@ -983,7 +1028,7 @@ cdef class Loop:
             self._poll_write_cb_errors_total))
         print()
 
-        print('--- Sock ops successfull on 1st try: ---')
+        print('--- Sock ops successful on 1st try: ---')
         print('Socket try-writes:         {}'.format(
             self._sock_try_write_total))
 
@@ -1040,12 +1085,20 @@ cdef class Loop:
         Any positional arguments after the callback will be passed to
         the callback when it is called.
         """
+        cdef uint64_t when
+
         self._check_closed()
         if self._debug == 1:
             self._check_thread()
+
         if delay < 0:
             delay = 0
-        cdef uint64_t when = <uint64_t>(delay * 1000)
+        elif delay == py_inf:
+            # ~100 years sounds like a good approximation of
+            # infinity for a Python application.
+            delay = 3600 * 24 * 365 * 100
+
+        when = <uint64_t>(delay * 1000)
         if not args:
             args = None
         if when == 0:
@@ -1196,7 +1249,8 @@ cdef class Loop:
                 # local task.
                 future.exception()
             raise
-        future.remove_done_callback(done_cb)
+        finally:
+            future.remove_done_callback(done_cb)
         if not future.done():
             raise RuntimeError('Event loop stopped before Future completed.')
 
@@ -1231,8 +1285,11 @@ cdef class Loop:
         if sl > 2:
             flowinfo = sockaddr[2]
             if flowinfo < 0 or flowinfo > 0xfffff:
-                raise OverflowError(
-                    'getsockaddrarg: flowinfo must be 0-1048575.')
+                if sys_version_info >= (3, 7, 0):
+                    msg = 'getnameinfo(): flowinfo must be 0-1048575.'
+                else:
+                    msg = 'getsockaddrarg: flowinfo must be 0-1048575.'
+                raise OverflowError(msg)
         else:
             flowinfo = 0
 
@@ -1894,29 +1951,25 @@ cdef class Loop:
                                      'in custom exception handler',
                                      exc_info=True)
 
-    def add_reader(self, fd, callback, *args):
+    def add_reader(self, fileobj, callback, *args):
         """Add a reader callback."""
-        self._ensure_fd_no_transport(fd)
         if len(args) == 0:
             args = None
-        self._add_reader(fd, new_Handle(self, callback, args))
+        self._add_reader(fileobj, new_Handle(self, callback, args))
 
-    def remove_reader(self, fd):
+    def remove_reader(self, fileobj):
         """Remove a reader callback."""
-        self._ensure_fd_no_transport(fd)
-        self._remove_reader(fd)
+        self._remove_reader(fileobj)
 
-    def add_writer(self, fd, callback, *args):
+    def add_writer(self, fileobj, callback, *args):
         """Add a writer callback.."""
-        self._ensure_fd_no_transport(fd)
         if len(args) == 0:
             args = None
-        self._add_writer(fd, new_Handle(self, callback, args))
+        self._add_writer(fileobj, new_Handle(self, callback, args))
 
-    def remove_writer(self, fd):
+    def remove_writer(self, fileobj):
         """Remove a writer callback."""
-        self._ensure_fd_no_transport(fd)
-        self._remove_writer(fd)
+        self._remove_writer(fileobj)
 
     def sock_recv(self, sock, n):
         """Receive data from the socket.

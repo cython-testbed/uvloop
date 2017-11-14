@@ -233,8 +233,12 @@ class uvloop_build_ext(build_ext):
              'Makefile.am', 'Makefile.in'],
             cwd=LIBUV_BUILD_DIR, env=env, check=True)
 
+        if 'LIBUV_CONFIGURE_HOST' in env:
+            cmd = ['./configure', '--host=' + env['LIBUV_CONFIGURE_HOST']]
+        else:
+            cmd = ['./configure']
         subprocess.run(
-            ['./configure'],
+            cmd,
             cwd=LIBUV_BUILD_DIR, env=env, check=True)
 
         j_flag = '-j{}'.format(os.cpu_count() or 1)
@@ -267,6 +271,8 @@ class uvloop_build_ext(build_ext):
             self.compiler.add_library('kvm')
         elif sys.platform.startswith('sunos'):
             self.compiler.add_library('kstat')
+            
+        self.compiler.add_library('pthread')
 
         super().build_extensions()
 

@@ -100,6 +100,7 @@ cdef sys_exc_info = sys.exc_info
 cdef sys_set_coroutine_wrapper = sys.set_coroutine_wrapper
 cdef sys_get_coroutine_wrapper = sys.get_coroutine_wrapper
 cdef sys_getframe = sys._getframe
+cdef sys_version_info = sys.version_info
 
 cdef ssl_SSLContext = ssl.SSLContext
 
@@ -126,6 +127,8 @@ cdef warnings_warn = warnings.warn
 
 cdef weakref_WeakValueDictionary = weakref.WeakValueDictionary
 cdef weakref_WeakSet = weakref.WeakSet
+
+cdef py_inf = float('inf')
 
 
 # Cython doesn't clean-up imported objects properly in Py3 mode,
