@@ -1,6 +1,6 @@
 import asyncio
 import socket
-import uvloop
+import unittest
 import sys
 
 from asyncio import test_utils
@@ -37,7 +37,8 @@ class MyDatagramProto(asyncio.DatagramProtocol):
 
 
 class _TestUDP:
-    def test_create_datagram_endpoint_addrs(self):
+
+    def _test_create_datagram_endpoint_addrs(self, family, lc_addr):
         class TestMyDatagramProto(MyDatagramProto):
             def __init__(inner_self):
                 super().__init__(loop=self.loop)
@@ -46,56 +47,61 @@ class _TestUDP:
                 super().datagram_received(data, addr)
                 self.transport.sendto(b'resp:' + data, addr)
 
-        for lc in (('127.0.0.1', 0), None):
-            if lc is None and not isinstance(self.loop, uvloop.Loop):
-                # TODO This looks like a bug in asyncio -- if no local_addr
-                # and no remote_addr are specified, the connection
-                # that asyncio creates is not bound anywhere.
-                return
+        coro = self.loop.create_datagram_endpoint(
+            TestMyDatagramProto,
+            local_addr=lc_addr,
+            family=family)
 
-            with self.subTest(local_addr=lc):
-                coro = self.loop.create_datagram_endpoint(
-                    TestMyDatagramProto, local_addr=lc, family=socket.AF_INET)
-                s_transport, server = self.loop.run_until_complete(coro)
-                host, port = s_transport.get_extra_info('sockname')
+        s_transport, server = self.loop.run_until_complete(coro)
 
-                self.assertIsInstance(server, TestMyDatagramProto)
-                self.assertEqual('INITIALIZED', server.state)
-                self.assertIs(server.transport, s_transport)
+        host, port, *_ = s_transport.get_extra_info('sockname')
 
-                extra = {}
-                if hasattr(socket, 'SO_REUSEPORT') and \
-                        sys.version_info[:3] >= (3, 5, 1):
-                    extra['reuse_port'] = True
+        self.assertIsInstance(server, TestMyDatagramProto)
+        self.assertEqual('INITIALIZED', server.state)
+        self.assertIs(server.transport, s_transport)
 
-                coro = self.loop.create_datagram_endpoint(
-                    lambda: MyDatagramProto(loop=self.loop),
-                    family=socket.AF_INET,
-                    remote_addr=None if lc is None else (host, port),
-                    **extra)
-                transport, client = self.loop.run_until_complete(coro)
+        extra = {}
+        if hasattr(socket, 'SO_REUSEPORT') and \
+                sys.version_info[:3] >= (3, 5, 1):
+            extra['reuse_port'] = True
 
-                self.assertIsInstance(client, MyDatagramProto)
-                self.assertEqual('INITIALIZED', client.state)
-                self.assertIs(client.transport, transport)
+        coro = self.loop.create_datagram_endpoint(
+            lambda: MyDatagramProto(loop=self.loop),
+            family=family,
+            remote_addr=(host, port),
+            **extra)
+        transport, client = self.loop.run_until_complete(coro)
 
-                transport.sendto(b'xxx', (host, port) if lc is None else None)
-                test_utils.run_until(self.loop, lambda: server.nbytes)
-                self.assertEqual(3, server.nbytes)
-                test_utils.run_until(self.loop, lambda: client.nbytes)
+        self.assertIsInstance(client, MyDatagramProto)
+        self.assertEqual('INITIALIZED', client.state)
+        self.assertIs(client.transport, transport)
 
-                # received
-                self.assertEqual(8, client.nbytes)
+        transport.sendto(b'xxx')
+        test_utils.run_until(self.loop, lambda: server.nbytes)
+        self.assertEqual(3, server.nbytes)
+        test_utils.run_until(self.loop, lambda: client.nbytes)
 
-                # extra info is available
-                self.assertIsNotNone(transport.get_extra_info('sockname'))
+        # received
+        self.assertEqual(8, client.nbytes)
 
-                # close connection
-                transport.close()
-                self.loop.run_until_complete(client.done)
-                self.assertEqual('CLOSED', client.state)
-                server.transport.close()
-                self.loop.run_until_complete(server.done)
+        # extra info is available
+        self.assertIsNotNone(transport.get_extra_info('sockname'))
+
+        # close connection
+        transport.close()
+        self.loop.run_until_complete(client.done)
+        self.assertEqual('CLOSED', client.state)
+        server.transport.close()
+        self.loop.run_until_complete(server.done)
+
+    def test_create_datagram_endpoint_addrs_ipv4(self):
+        self._test_create_datagram_endpoint_addrs(
+            socket.AF_INET, ('127.0.0.1', 0))
+
+    @unittest.skipUnless(tb.has_IPv6, 'no IPv6')
+    def test_create_datagram_endpoint_addrs_ipv6(self):
+        self._test_create_datagram_endpoint_addrs(
+            socket.AF_INET6, ('::1', 0))
 
     def test_create_datagram_endpoint_ipv6_family(self):
         class TestMyDatagramProto(MyDatagramProto):
@@ -114,6 +120,9 @@ class _TestUDP:
         finally:
             if s_transport:
                 s_transport.close()
+                # let it close
+                self.loop.run_until_complete(
+                    asyncio.sleep(0.1, loop=self.loop))
 
     def test_create_datagram_endpoint_sock(self):
         sock = None
@@ -157,6 +166,23 @@ class Test_UV_UDP(_TestUDP, tb.UVTestCase):
             with self.assertRaisesRegex(ValueError,
                                         'A UDP Socket was expected'):
                 self.loop.run_until_complete(coro)
+
+    def test_udp_sendto_dns(self):
+        coro = self.loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol,
+            local_addr=('127.0.0.1', 0),
+            family=socket.AF_INET)
+
+        s_transport, server = self.loop.run_until_complete(coro)
+
+        with self.assertRaisesRegex(ValueError, 'DNS lookup'):
+            s_transport.sendto(b'aaaa', ('example.com', 80))
+
+        with self.assertRaisesRegex(ValueError, 'socket family mismatch'):
+            s_transport.sendto(b'aaaa', ('::1', 80))
+
+        s_transport.close()
+        self.loop.run_until_complete(asyncio.sleep(0.01, loop=self.loop))
 
 
 class Test_AIO_UDP(_TestUDP, tb.AIOTestCase):

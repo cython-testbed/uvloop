@@ -117,7 +117,12 @@ cdef class UVBaseTransport(UVSocketHandle):
     cdef _wakeup_waiter(self):
         if self._waiter is not None:
             if not self._waiter.cancelled():
-                self._waiter.set_result(True)
+                if not self._is_alive():
+                    self._waiter.set_exception(
+                        RuntimeError(
+                            'closed Transport handle and unset waiter'))
+                else:
+                    self._waiter.set_result(True)
             self._waiter = None
 
     cdef _call_connection_made(self):
@@ -125,6 +130,17 @@ cdef class UVBaseTransport(UVSocketHandle):
         if self._protocol is None:
             raise RuntimeError(
                 'protocol is not set, cannot call connection_made()')
+
+        # We use `_is_alive()` and not `_closing`, because we call
+        # `transport._close()` in `loop.create_connection()` if an
+        # exception happens during `await waiter`.
+        if not self._is_alive():
+            # A connection waiter can be cancelled between
+            # 'await loop.create_connection()' and
+            # `_schedule_call_connection_made` and
+            # the actual `_call_connection_made`.
+            self._wakeup_waiter()
+            return
 
         _loop_ready_len = self._loop._ready_len
 
@@ -139,7 +155,7 @@ cdef class UVBaseTransport(UVSocketHandle):
             self._wakeup_waiter()
             raise
 
-        if self._closing:
+        if not self._is_alive():
             # This might happen when "transport.abort()" is called
             # from "Protocol.connection_made".
             self._wakeup_waiter()

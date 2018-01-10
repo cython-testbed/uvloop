@@ -50,7 +50,7 @@ cdef __tcp_get_socket(UVSocketHandle handle):
     if err < 0:
         raise convert_error(err)
 
-    return socket_socket(buf.ss_family, uv.SOCK_STREAM, 0, fileno)
+    return PseudoSocket(buf.ss_family, uv.SOCK_STREAM, 0, fileno)
 
 
 @cython.no_gc_clear
@@ -106,7 +106,15 @@ cdef class TCPTransport(UVStream):
         __tcp_init_uv_handle(<UVStream>handle, loop, uv.AF_UNSPEC)
         handle.__peername_set = 0
         handle.__sockname_set = 0
+        handle._set_nodelay()
         return handle
+
+    cdef _set_nodelay(self):
+        cdef int err
+        self._ensure_alive()
+        err = uv.uv_tcp_nodelay(<uv.uv_tcp_t*>self._handle, 1);
+        if err < 0:
+            raise convert_error(err)
 
     cdef _call_connection_made(self):
         # asyncio saves peername & sockname when transports are instantiated,
@@ -171,12 +179,10 @@ cdef class TCPTransport(UVStream):
 cdef class _TCPConnectRequest(UVRequest):
     cdef:
         TCPTransport transport
+        uv.uv_connect_t _req_data
 
     def __cinit__(self, loop, transport):
-        self.request = <uv.uv_req_t*> PyMem_RawMalloc(sizeof(uv.uv_connect_t))
-        if self.request is NULL:
-            self.on_done()
-            raise MemoryError()
+        self.request = <uv.uv_req_t*>&self._req_data
         self.request.data = <void*>self
         self.transport = transport
 

@@ -254,6 +254,10 @@ cdef class UVStream(UVBaseTransport):
 
     cdef _start_reading(self):
         cdef int err
+
+        if self._closing:
+            return
+
         self._ensure_alive()
 
         if self.__reading:
@@ -664,21 +668,16 @@ cdef class UVStream(UVBaseTransport):
     def can_write_eof(self):
         return True
 
-    def pause_reading(self):
-        self._ensure_alive()
+    def is_reading(self):
+        return self._is_reading()
 
-        if self._closing:
-            raise RuntimeError('Cannot pause_reading() when closing')
-        if not self._is_reading():
-            raise RuntimeError('Already paused')
+    def pause_reading(self):
+        if self._closing or not self._is_reading():
+            return
         self._stop_reading()
 
     def resume_reading(self):
-        self._ensure_alive()
-
-        if self._is_reading():
-            raise RuntimeError('Not paused')
-        if self._closing:
+        if self._is_reading() or self._closing:
             return
         self._start_reading()
 

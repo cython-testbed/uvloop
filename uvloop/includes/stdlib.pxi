@@ -9,10 +9,11 @@ import gc
 import inspect
 import itertools
 import os
-import signal as std_signal
+import signal
 import socket
 import subprocess
 import ssl
+import stat
 import sys
 import threading
 import traceback
@@ -30,6 +31,7 @@ cdef aio_Task = asyncio.Task
 cdef aio_ensure_future = asyncio.ensure_future
 cdef aio_gather = asyncio.gather
 cdef aio_wait = asyncio.wait
+cdef aio_wrap_future = asyncio.wrap_future
 cdef aio_logger = asyncio.log.logger
 cdef aio_iscoroutine = asyncio.iscoroutine
 cdef aio_iscoroutinefunction = asyncio.iscoroutinefunction
@@ -44,10 +46,12 @@ cdef aio_set_running_loop = getattr(asyncio, '_set_running_loop', None)
 cdef col_deque = collections.deque
 cdef col_Iterable = collections.Iterable
 cdef col_Counter = collections.Counter
+cdef col_OrderedDict = collections.OrderedDict
 
 cdef cc_ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
 cdef cc_Future = concurrent.futures.Future
 
+cdef errno_EBADF = errno.EBADF
 cdef errno_EINVAL = errno.EINVAL
 
 cdef ft_partial = functools.partial
@@ -59,6 +63,8 @@ cdef inspect_isgenerator = inspect.isgenerator
 
 cdef int has_SO_REUSEPORT = hasattr(socket, 'SO_REUSEPORT')
 cdef int SO_REUSEPORT = getattr(socket, 'SO_REUSEPORT', 0)
+cdef int SO_BROADCAST = getattr(socket, 'SO_BROADCAST')
+cdef int SOCK_NONBLOCK = getattr(socket, 'SOCK_NONBLOCK', -1)
 
 cdef socket_gaierror = socket.gaierror
 cdef socket_error = socket.error
@@ -66,6 +72,8 @@ cdef socket_timeout = socket.timeout
 cdef socket_socket = socket.socket
 cdef socket_socketpair = socket.socketpair
 cdef socket_getservbyname = socket.getservbyname
+cdef socket_AddressFamily = socket.AddressFamily
+cdef socket_SocketKind = socket.SocketKind
 
 cdef int socket_EAI_ADDRFAMILY = getattr(socket, 'EAI_ADDRFAMILY', -1)
 cdef int socket_EAI_AGAIN      = getattr(socket, 'EAI_AGAIN', -1)
@@ -94,6 +102,10 @@ cdef os_devnull = os.devnull
 cdef os_O_RDWR = os.O_RDWR
 cdef os_pipe = os.pipe
 cdef os_read = os.read
+cdef os_remove = os.remove
+cdef os_stat = os.stat
+
+cdef stat_S_ISSOCK = stat.S_ISSOCK
 
 cdef sys_ignore_environment = sys.flags.ignore_environment
 cdef sys_exc_info = sys.exc_info
@@ -111,16 +123,18 @@ cdef int subprocess_STDOUT = subprocess.STDOUT
 cdef int subprocess_DEVNULL = subprocess.DEVNULL
 cdef subprocess_SubprocessError = subprocess.SubprocessError
 
-cdef int signal_NSIG = std_signal.NSIG
-cdef signal_signal = std_signal.signal
-cdef signal_set_wakeup_fd = std_signal.set_wakeup_fd
-cdef signal_default_int_handler = std_signal.default_int_handler
-cdef signal_SIG_DFL = std_signal.SIG_DFL
+cdef int signal_NSIG = signal.NSIG
+cdef signal_signal = signal.signal
+cdef signal_siginterrupt = signal.siginterrupt
+cdef signal_set_wakeup_fd = signal.set_wakeup_fd
+cdef signal_default_int_handler = signal.default_int_handler
+cdef signal_SIG_DFL = signal.SIG_DFL
 
 cdef time_sleep = time.sleep
 cdef time_monotonic = time.monotonic
 
-cdef tb_extract_stack = traceback.extract_stack
+cdef tb_StackSummary = traceback.StackSummary
+cdef tb_walk_stack = traceback.walk_stack
 cdef tb_format_list = traceback.format_list
 
 cdef warnings_warn = warnings.warn
@@ -135,5 +149,5 @@ cdef py_inf = float('inf')
 # so we delete refs to all modules manually (except sys)
 del asyncio, concurrent, collections, errno
 del functools, inspect, itertools, socket, os, threading
-del std_signal, subprocess, ssl
+del signal, subprocess, ssl
 del time, traceback, warnings, weakref

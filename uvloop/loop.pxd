@@ -52,6 +52,8 @@ cdef class Loop:
         set _queued_streams
         Py_ssize_t _ready_len
 
+        set _servers
+
         object _transports
         dict _fd_to_reader_fileobj
         dict _fd_to_writer_fileobj
@@ -59,6 +61,7 @@ cdef class Loop:
         dict _signal_handlers
         object _ssock
         object _csock
+        bint _listening_signals
 
         set _timers
         dict _polls
@@ -164,6 +167,8 @@ cdef class Loop:
     cdef _fileobj_to_fd(self, fileobj)
     cdef _ensure_fd_no_transport(self, fd)
 
+    cdef _new_reader_future(self, sock)
+    cdef _new_writer_future(self, sock)
     cdef _add_reader(self, fd, Handle handle)
     cdef _remove_reader(self, fd)
 
@@ -171,21 +176,27 @@ cdef class Loop:
     cdef _remove_writer(self, fd)
 
     cdef _sock_recv(self, fut, sock, n)
+    cdef _sock_recv_into(self, fut, sock, buf)
     cdef _sock_sendall(self, fut, sock, data)
     cdef _sock_accept(self, fut, sock)
 
-    cdef _sock_connect(self, fut, sock, address)
+    cdef _sock_connect(self, sock, address)
     cdef _sock_connect_cb(self, fut, sock, address)
 
     cdef _sock_set_reuseport(self, int fd)
 
     cdef _setup_signals(self)
     cdef _shutdown_signals(self)
+    cdef _recv_signals_start(self)
+    cdef _recv_signals_stop(self)
+
     cdef _handle_signal(self, sig)
     cdef _read_from_self(self)
     cdef _process_self_data(self, data)
 
     cdef _set_coroutine_wrapper(self, bint enabled)
+
+    cdef _print_debug_info(self)
 
 
 include "cbhandles.pxd"

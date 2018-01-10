@@ -22,7 +22,7 @@ from setuptools.command.build_ext import build_ext as build_ext
 from setuptools.command.sdist import sdist as sdist
 
 
-VERSION = '0.8.1'
+VERSION = '0.9.2.dev0'
 CFLAGS = ['-O2']
 LIBUV_DIR = os.path.join(os.path.dirname(__file__), 'vendor', 'libuv')
 LIBUV_BUILD_DIR = os.path.join(os.path.dirname(__file__), 'build', 'libuv')
@@ -271,7 +271,7 @@ class uvloop_build_ext(build_ext):
             self.compiler.add_library('kvm')
         elif sys.platform.startswith('sunos'):
             self.compiler.add_library('kstat')
-            
+
         self.compiler.add_library('pthread')
 
         super().build_extensions()

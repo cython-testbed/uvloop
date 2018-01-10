@@ -1,7 +1,7 @@
 cdef class Handle:
     cdef:
         Loop loop
-        bint cancelled
+        bint _cancelled
 
         str meth_name
         int cb_type
@@ -16,11 +16,13 @@ cdef class Handle:
     cdef inline _run(self)
     cdef _cancel(self)
 
+    cdef _format_handle(self)
+
 
 cdef class TimerHandle:
     cdef:
         object callback, args
-        bint closed
+        bint _cancelled
         UVTimer timer
         Loop loop
         object __weakref__
@@ -29,3 +31,4 @@ cdef class TimerHandle:
 
     cdef _run(self)
     cdef _cancel(self)
+    cdef inline _clear(self)

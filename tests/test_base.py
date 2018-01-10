@@ -348,10 +348,30 @@ class _TestBase:
         # format message
         msg = log.call_args[0][0] % log.call_args[0][1:]
 
-        # self.assertIn('Executing <Handle', msg)
-        # self.assertIn('test_debug_slow_callbacks', msg)
+        self.assertIn('Executing <TimerHandle', msg)
+        self.assertIn('test_debug_slow_timer_callbacks', msg)
+
+    def test_debug_slow_task_callbacks(self):
+        logger = logging.getLogger('asyncio')
+        self.loop.set_debug(True)
+        self.loop.slow_callback_duration = 0.2
+
+        async def foo():
+            time.sleep(0.3)
+
+        with mock.patch.object(logger, 'warning') as log:
+            self.loop.run_until_complete(foo())
+
+        self.assertEqual(log.call_count, 1)
+        # format message
+        msg = log.call_args[0][0] % log.call_args[0][1:]
+
+        self.assertIn('Executing <Task finished', msg)
+        self.assertIn('test_debug_slow_task_callbacks', msg)
 
     def test_default_exc_handler_callback(self):
+        self.loop.set_exception_handler(None)
+
         self.loop._process_events = mock.Mock()
 
         def zero_error(fut):
@@ -381,6 +401,7 @@ class _TestBase:
                 exc_info=mock.ANY)
 
     def test_set_exc_handler_custom(self):
+        self.loop.set_exception_handler(None)
         logger = logging.getLogger('asyncio')
 
         def run_loop():
@@ -640,6 +661,30 @@ class TestBaseUV(_TestBase, UVTestCase):
         self.assertTrue(isinstance(fut, asyncio.Future))
         self.assertIs(fut._loop, self.loop)
         fut.cancel()
+
+    def test_loop_call_soon_handle_cancelled(self):
+        cb = lambda: False
+        handle = self.loop.call_soon(cb)
+        self.assertFalse(handle.cancelled())
+        handle.cancel()
+        self.assertTrue(handle.cancelled())
+
+        handle = self.loop.call_soon(cb)
+        self.assertFalse(handle.cancelled())
+        self.run_loop_briefly()
+        self.assertFalse(handle.cancelled())
+
+    def test_loop_call_later_handle_cancelled(self):
+        cb = lambda: False
+        handle = self.loop.call_later(0.01, cb)
+        self.assertFalse(handle.cancelled())
+        handle.cancel()
+        self.assertTrue(handle.cancelled())
+
+        handle = self.loop.call_later(0.01, cb)
+        self.assertFalse(handle.cancelled())
+        self.run_loop_briefly(delay=0.05)
+        self.assertFalse(handle.cancelled())
 
     def test_loop_std_files_cloexec(self):
         # See https://github.com/MagicStack/uvloop/issues/40 for details.

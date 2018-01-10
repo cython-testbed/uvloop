@@ -31,7 +31,7 @@ cdef __pipe_open(UVStream handle, int fd):
 
 cdef __pipe_get_socket(UVSocketHandle handle):
     fileno = handle._fileno()
-    return socket_socket(uv.AF_UNIX, uv.SOCK_STREAM, 0, fileno)
+    return PseudoSocket(uv.AF_UNIX, uv.SOCK_STREAM, 0, fileno)
 
 
 @cython.no_gc_clear
@@ -176,12 +176,10 @@ cdef class WriteUnixTransport(UVStream):
 cdef class _PipeConnectRequest(UVRequest):
     cdef:
         UnixTransport transport
+        uv.uv_connect_t _req_data
 
     def __cinit__(self, loop, transport):
-        self.request = <uv.uv_req_t*> PyMem_RawMalloc(sizeof(uv.uv_connect_t))
-        if self.request is NULL:
-            self.on_done()
-            raise MemoryError()
+        self.request = <uv.uv_req_t*> &self._req_data
         self.request.data = <void*>self
         self.transport = transport
 

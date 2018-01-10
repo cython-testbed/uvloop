@@ -2,7 +2,7 @@
 @cython.freelist(DEFAULT_FREELIST_SIZE)
 cdef class Handle:
     def __cinit__(self):
-        self.cancelled = 0
+        self._cancelled = 0
         self.cb_type = 0
         self._source_traceback = None
 
@@ -12,7 +12,7 @@ cdef class Handle:
             loop._debug_cb_handles_total += 1
             loop._debug_cb_handles_count += 1
         if loop._debug:
-            self._source_traceback = tb_extract_stack(sys_getframe(0))
+            self._source_traceback = extract_stack()
 
     def __dealloc__(self):
         if UVLOOP_DEBUG and self.loop is not None:
@@ -30,7 +30,7 @@ cdef class Handle:
             int cb_type
             object callback
 
-        if self.cancelled:
+        if self._cancelled:
             return
 
         cb_type = self.cb_type
@@ -86,16 +86,24 @@ cdef class Handle:
             Py_DECREF(self)
 
     cdef _cancel(self):
-        self.cancelled = 1
+        self._cancelled = 1
         self.callback = NULL
         self.arg2 = self.arg3 = self.arg4 = None
+
+    cdef _format_handle(self):
+        # Mirrors `asyncio.base_events._format_handle`.
+        if self.cb_type == 1:
+            cb = self.arg1
+            if isinstance(getattr(cb, '__self__', None), aio_Task):
+                return repr(cb.__self__)
+        return repr(self)
 
     # Public API
 
     def __repr__(self):
         info = [self.__class__.__name__]
 
-        if self.cancelled:
+        if self._cancelled:
             info.append('cancelled')
 
         if self.cb_type == 1:
@@ -120,6 +128,9 @@ cdef class Handle:
     def cancel(self):
         self._cancel()
 
+    def cancelled(self):
+        return self._cancelled
+
 
 @cython.no_gc_clear
 @cython.freelist(DEFAULT_FREELIST_SIZE)
@@ -130,10 +141,10 @@ cdef class TimerHandle:
         self.loop = loop
         self.callback = callback
         self.args = args
-        self.closed = 0
+        self._cancelled = 0
 
         if loop._debug:
-            self._source_traceback = tb_extract_stack(sys_getframe(0))
+            self._source_traceback = extract_stack()
 
         self.timer = UVTimer.new(
             loop, <method_t>self._run, self, delay)
@@ -150,15 +161,19 @@ cdef class TimerHandle:
     def __dealloc__(self):
         if UVLOOP_DEBUG:
             self.loop._debug_cb_timer_handles_count -= 1
-        if self.closed == 0:
+        if self.timer is not None:
             raise RuntimeError('active TimerHandle is deallacating')
 
     cdef _cancel(self):
-        if self.closed == 1:
+        if self._cancelled == 1:
             return
-        self.closed = 1
+        self._cancelled = 1
+        self._clear()
 
-        self.callback = None
+    cdef inline _clear(self):
+        if self.timer is None:
+            return
+
         self.args = None
 
         try:
@@ -168,12 +183,12 @@ cdef class TimerHandle:
             self.timer = None  # let it die asap
 
     cdef _run(self):
-        if self.closed == 1:
+        if self._cancelled == 1:
             return
 
         callback = self.callback
         args = self.args
-        self._cancel()
+        self._clear()
 
         Py_INCREF(self)  # Since _run is a cdef and there's no BoundMethod,
                          # we guard 'self' manually.
@@ -210,7 +225,7 @@ cdef class TimerHandle:
     def __repr__(self):
         info = [self.__class__.__name__]
 
-        if self.closed:
+        if self._cancelled:
             info.append('cancelled')
 
         func = self.callback
@@ -228,6 +243,9 @@ cdef class TimerHandle:
             info.append('created at {}:{}'.format(frame[0], frame[1]))
 
         return '<' + ' '.join(info) + '>'
+
+    def cancelled(self):
+        return self._cancelled
 
     def cancel(self):
         self._cancel()
@@ -310,3 +328,22 @@ cdef new_MethodHandle3(Loop loop, str name, method3_t callback, object ctx,
     handle.arg4 = arg3
 
     return handle
+
+
+cdef extract_stack():
+    """Replacement for traceback.extract_stack() that only does the
+    necessary work for asyncio debug mode.
+    """
+    f = sys_getframe()
+    if f is None:
+        return
+
+    try:
+        stack = tb_StackSummary.extract(tb_walk_stack(f),
+                                        limit=DEBUG_STACK_DEPTH,
+                                        lookup_lines=False)
+    finally:
+        f = None
+
+    stack.reverse()
+    return stack

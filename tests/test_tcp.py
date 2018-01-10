@@ -1,4 +1,5 @@
 import asyncio
+import asyncio.sslproto
 import gc
 import socket
 import unittest.mock
@@ -6,6 +7,7 @@ import uvloop
 import ssl
 import sys
 import threading
+import weakref
 
 from uvloop import _testbase as tb
 
@@ -70,6 +72,12 @@ class _TestTCP:
             writer.write(bytearray(b'A'))
             writer.write(memoryview(b'M'))
 
+            if self.implementation == 'uvloop':
+                tr = writer.transport
+                sock = tr.get_extra_info('socket')
+                self.assertTrue(
+                    sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+
             await writer.drain()
             writer.close()
 
@@ -94,6 +102,10 @@ class _TestTCP:
                 while len(buf) != 4:
                     buf += await self.loop.sock_recv(sock, 1)
                 self.assertEqual(buf, b'SPAM')
+
+            self.assertEqual(sock.fileno(), -1)
+            self.assertEqual(sock._io_refs, 0)
+            self.assertTrue(sock._closed)
 
         async def start_server():
             nonlocal CNT
@@ -262,19 +274,51 @@ class _TestTCP:
 
         self.loop.run_until_complete(runner())
 
-    def test_create_connection_1(self):
-        CNT = 0
-        TOTAL_CNT = 100
+    def test_create_server_7(self):
+        # Test that create_server() stores a hard ref to the server object
+        # somewhere in the loop.  In asyncio it so happens that
+        # loop.sock_accept() has a reference to the server object so it
+        # never gets GCed.
 
-        def server():
-            data = yield tb.read(4)
-            self.assertEqual(data, b'AAAA')
-            yield tb.write(b'OK')
+        class Proto(asyncio.Protocol):
+            def connection_made(self, tr):
+                self.tr = tr
+                self.tr.write(b'hello')
 
-            data = yield tb.read(4)
-            self.assertEqual(data, b'BBBB')
-            yield tb.write(b'SPAM')
+        async def test():
+            port = tb.find_free_port()
+            srv = await self.loop.create_server(Proto, '127.0.0.1', port)
+            wsrv = weakref.ref(srv)
+            del srv
 
+            gc.collect()
+            gc.collect()
+            gc.collect()
+
+            s = socket.socket(socket.AF_INET)
+            with s:
+                s.setblocking(False)
+                await self.loop.sock_connect(s, ('127.0.0.1', port))
+                d = await self.loop.sock_recv(s, 100)
+                self.assertEqual(d, b'hello')
+
+            srv = wsrv()
+            srv.close()
+            await srv.wait_closed()
+            del srv
+
+            # Let all transports shutdown.
+            await asyncio.sleep(0.1, loop=self.loop)
+
+            gc.collect()
+            gc.collect()
+            gc.collect()
+
+            self.assertIsNone(wsrv())
+
+        self.loop.run_until_complete(test())
+
+    def test_create_connection_open_con_addr(self):
         async def client(addr):
             reader, writer = await asyncio.open_connection(
                 *addr,
@@ -290,12 +334,18 @@ class _TestTCP:
             writer.write(b'BBBB')
             self.assertEqual(await reader.readexactly(4), b'SPAM')
 
-            nonlocal CNT
-            CNT += 1
+            if self.implementation == 'uvloop':
+                tr = writer.transport
+                sock = tr.get_extra_info('socket')
+                self.assertTrue(
+                    sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
 
             writer.close()
 
-        async def client_2(addr):
+        self._test_create_connection_1(client)
+
+    def test_create_connection_open_con_sock(self):
+        async def client(addr):
             sock = socket.socket()
             sock.connect(addr)
             reader, writer = await asyncio.open_connection(
@@ -308,31 +358,51 @@ class _TestTCP:
             writer.write(b'BBBB')
             self.assertEqual(await reader.readexactly(4), b'SPAM')
 
-            nonlocal CNT
-            CNT += 1
+            if self.implementation == 'uvloop':
+                tr = writer.transport
+                sock = tr.get_extra_info('socket')
+                self.assertTrue(
+                    sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
 
             writer.close()
+
+        self._test_create_connection_1(client)
+
+    def _test_create_connection_1(self, client):
+        CNT = 0
+        TOTAL_CNT = 100
+
+        def server(sock):
+            data = sock.recv_all(4)
+            self.assertEqual(data, b'AAAA')
+            sock.send(b'OK')
+
+            data = sock.recv_all(4)
+            self.assertEqual(data, b'BBBB')
+            sock.send(b'SPAM')
+
+        async def client_wrapper(addr):
+            await client(addr)
+            nonlocal CNT
+            CNT += 1
 
         def run(coro):
             nonlocal CNT
             CNT = 0
 
-            srv = tb.tcp_server(server,
-                                max_clients=TOTAL_CNT,
-                                backlog=TOTAL_CNT)
-            srv.start()
+            with self.tcp_server(server,
+                                 max_clients=TOTAL_CNT,
+                                 backlog=TOTAL_CNT) as srv:
+                tasks = []
+                for _ in range(TOTAL_CNT):
+                    tasks.append(coro(srv.addr))
 
-            tasks = []
-            for _ in range(TOTAL_CNT):
-                tasks.append(coro(srv.addr))
+                self.loop.run_until_complete(
+                    asyncio.gather(*tasks, loop=self.loop))
 
-            self.loop.run_until_complete(
-                asyncio.gather(*tasks, loop=self.loop))
-            srv.join()
             self.assertEqual(CNT, TOTAL_CNT)
 
-        run(client)
-        run(client_2)
+        run(client_wrapper)
 
     def test_create_connection_2(self):
         sock = socket.socket()
@@ -355,10 +425,10 @@ class _TestTCP:
         CNT = 0
         TOTAL_CNT = 100
 
-        def server():
-            data = yield tb.read(4)
+        def server(sock):
+            data = sock.recv_all(4)
             self.assertEqual(data, b'AAAA')
-            yield tb.close()
+            sock.close()
 
         async def client(addr):
             reader, writer = await asyncio.open_connection(
@@ -379,18 +449,16 @@ class _TestTCP:
             nonlocal CNT
             CNT = 0
 
-            srv = tb.tcp_server(server,
-                                max_clients=TOTAL_CNT,
-                                backlog=TOTAL_CNT)
-            srv.start()
+            with self.tcp_server(server,
+                                 max_clients=TOTAL_CNT,
+                                 backlog=TOTAL_CNT) as srv:
+                tasks = []
+                for _ in range(TOTAL_CNT):
+                    tasks.append(coro(srv.addr))
 
-            tasks = []
-            for _ in range(TOTAL_CNT):
-                tasks.append(coro(srv.addr))
+                self.loop.run_until_complete(
+                    asyncio.gather(*tasks, loop=self.loop))
 
-            self.loop.run_until_complete(
-                asyncio.gather(*tasks, loop=self.loop))
-            srv.join()
             self.assertEqual(CNT, TOTAL_CNT)
 
         run(client)
@@ -409,6 +477,29 @@ class _TestTCP:
                 await client()
 
         self.loop.run_until_complete(runner())
+
+    def test_create_connection_5(self):
+        def server(sock):
+            try:
+                data = sock.recv_all(4)
+            except ConnectionError:
+                return
+            self.assertEqual(data, b'AAAA')
+            sock.send(b'OK')
+
+        async def client(addr):
+            fut = asyncio.ensure_future(
+                self.loop.create_connection(asyncio.Protocol, *addr),
+                loop=self.loop)
+            await asyncio.sleep(0, loop=self.loop)
+            fut.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await fut
+
+        with self.tcp_server(server,
+                             max_clients=1,
+                             backlog=1) as srv:
+            self.loop.run_until_complete(client(srv.addr))
 
     def test_transport_shutdown(self):
         CNT = 0           # number of clients that were successful
@@ -549,10 +640,15 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
                 t.set_protocol(p)
 
             self.assertFalse(t._paused)
+            self.assertTrue(t.is_reading())
             t.pause_reading()
+            t.pause_reading()  # Check that it's OK to call it 2nd time.
             self.assertTrue(t._paused)
+            self.assertFalse(t.is_reading())
             t.resume_reading()
+            t.resume_reading()  # Check that it's OK to call it 2nd time.
             self.assertFalse(t._paused)
+            self.assertTrue(t.is_reading())
 
             sock = t.get_extra_info('socket')
             self.assertIs(sock, t.get_extra_info('socket'))
@@ -568,7 +664,6 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
             with self.assertRaisesRegex(RuntimeError, 'is used by transport'):
                 self.loop.remove_reader(sock.fileno())
 
-            self.assertTrue(isinstance(sock, socket.socket))
             self.assertEqual(t.get_extra_info('sockname'),
                              sockname)
             self.assertEqual(t.get_extra_info('peername'),
@@ -579,6 +674,12 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
             self.assertFalse(t._closing)
             t.abort()
             self.assertTrue(t._closing)
+
+            self.assertFalse(t.is_reading())
+            # Check that pause_reading and resume_reading don't raise
+            # errors if called after the transport is closed.
+            t.pause_reading()
+            t.resume_reading()
 
             await fut
 
@@ -707,7 +808,13 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         with self.assertWarnsRegex(ResourceWarning, rx):
             self.loop.create_task(run())
             self.loop.run_until_complete(srv.wait_closed())
+            self.loop.run_until_complete(asyncio.sleep(0.1, loop=self.loop))
+
+            srv = None
             gc.collect()
+            gc.collect()
+            gc.collect()
+
             self.loop.run_until_complete(asyncio.sleep(0.1, loop=self.loop))
 
         # Since one TCPTransport handle wasn't closed correctly,
@@ -761,7 +868,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
                 super().data_received(data)
                 self.transport.write(expected_response)
 
-        lsock = socket.socket()
+        lsock = socket.socket(socket.AF_INET)
         lsock.bind(('127.0.0.1', 0))
         lsock.listen(1)
         addr = lsock.getsockname()
@@ -773,7 +880,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         def client():
             nonlocal response
             try:
-                csock = socket.socket()
+                csock = socket.socket(socket.AF_INET)
                 if client_ssl is not None:
                     csock = client_ssl.wrap_socket(csock)
                 csock.connect(addr)
@@ -804,7 +911,13 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         self.assertEqual(proto.nbytes, len(message))
         self.assertEqual(response, expected_response)
         tr, _ = f.result()
+
+        if server_ssl:
+            self.assertIsInstance(tr, asyncio.sslproto._SSLProtocolTransport)
+
         tr.close()
+        # let it close
+        self.loop.run_until_complete(asyncio.sleep(0.1, loop=self.loop))
 
     @unittest.skipUnless(hasattr(socket, 'AF_UNIX'), 'no Unix sockets')
     def test_create_connection_wrong_sock(self):
@@ -877,27 +990,27 @@ class _TestSSL(tb.SSLTestCase):
         async def test_client(addr):
             fut = asyncio.Future(loop=self.loop)
 
-            def prog():
+            def prog(sock):
                 try:
-                    yield tb.starttls(client_sslctx)
-                    yield tb.connect(addr)
-                    yield tb.write(A_DATA)
+                    sock.starttls(client_sslctx)
+                    sock.connect(addr)
+                    sock.send(A_DATA)
 
-                    data = yield tb.read(2)
+                    data = sock.recv_all(2)
                     self.assertEqual(data, b'OK')
 
-                    yield tb.write(B_DATA)
-                    data = yield tb.read(4)
+                    sock.send(B_DATA)
+                    data = sock.recv_all(4)
                     self.assertEqual(data, b'SPAM')
 
-                    yield tb.close()
+                    sock.close()
 
                 except Exception as ex:
                     self.loop.call_soon_threadsafe(fut.set_exception, ex)
                 else:
                     self.loop.call_soon_threadsafe(fut.set_result, None)
 
-            client = tb.tcp_client(prog)
+            client = self.tcp_client(prog)
             client.start()
             clients.append(client)
 
@@ -938,6 +1051,10 @@ class _TestSSL(tb.SSLTestCase):
             client.stop()
 
     def test_create_connection_ssl_1(self):
+        if self.implementation == 'asyncio':
+            # Don't crash on asyncio errors
+            self.loop.set_exception_handler(None)
+
         CNT = 0
         TOTAL_CNT = 25
 
@@ -947,20 +1064,20 @@ class _TestSSL(tb.SSLTestCase):
         sslctx = self._create_server_ssl_context(self.ONLYCERT, self.ONLYKEY)
         client_sslctx = self._create_client_ssl_context()
 
-        def server():
-            yield tb.starttls(
+        def server(sock):
+            sock.starttls(
                 sslctx,
                 server_side=True)
 
-            data = yield tb.read(len(A_DATA))
+            data = sock.recv_all(len(A_DATA))
             self.assertEqual(data, A_DATA)
-            yield tb.write(b'OK')
+            sock.send(b'OK')
 
-            data = yield tb.read(len(B_DATA))
+            data = sock.recv_all(len(B_DATA))
             self.assertEqual(data, B_DATA)
-            yield tb.write(b'SPAM')
+            sock.send(b'SPAM')
 
-            yield tb.close()
+            sock.close()
 
         async def client(addr):
             reader, writer = await asyncio.open_connection(
@@ -1005,18 +1122,16 @@ class _TestSSL(tb.SSLTestCase):
             nonlocal CNT
             CNT = 0
 
-            srv = tb.tcp_server(server,
-                                max_clients=TOTAL_CNT,
-                                backlog=TOTAL_CNT)
-            srv.start()
+            with self.tcp_server(server,
+                                 max_clients=TOTAL_CNT,
+                                 backlog=TOTAL_CNT) as srv:
+                tasks = []
+                for _ in range(TOTAL_CNT):
+                    tasks.append(coro(srv.addr))
 
-            tasks = []
-            for _ in range(TOTAL_CNT):
-                tasks.append(coro(srv.addr))
+                self.loop.run_until_complete(
+                    asyncio.gather(*tasks, loop=self.loop))
 
-            self.loop.run_until_complete(
-                asyncio.gather(*tasks, loop=self.loop))
-            srv.join()
             self.assertEqual(CNT, TOTAL_CNT)
 
         with self._silence_eof_received_warning():
@@ -1024,9 +1139,6 @@ class _TestSSL(tb.SSLTestCase):
 
         with self._silence_eof_received_warning():
             run(client_sock)
-
-
-class Test_UV_TCPSSL(_TestSSL, tb.UVTestCase):
 
     def test_ssl_connect_accepted_socket(self):
         server_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
@@ -1043,6 +1155,9 @@ class Test_UV_TCPSSL(_TestSSL, tb.UVTestCase):
         Test_UV_TCP.test_connect_accepted_socket(
             self, server_context, client_context)
 
+
+class Test_UV_TCPSSL(_TestSSL, tb.UVTestCase):
+    pass
 
 
 class Test_AIO_TCPSSL(_TestSSL, tb.AIOTestCase):

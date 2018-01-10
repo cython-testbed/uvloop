@@ -39,17 +39,23 @@ include "errors.pyx"
 
 
 cdef _is_sock_stream(sock_type):
-    # Linux's socket.type is a bitmask that can include extra info
-    # about socket, therefore we can't do simple
-    # `sock_type == socket.SOCK_STREAM`.
-    return (sock_type & uv.SOCK_STREAM) == uv.SOCK_STREAM
+    if SOCK_NONBLOCK == -1:
+        return sock_type == uv.SOCK_STREAM
+    else:
+        # Linux's socket.type is a bitmask that can include extra info
+        # about socket (like SOCK_NONBLOCK bit), therefore we can't do simple
+        # `sock_type == socket.SOCK_STREAM`, see
+        # https://github.com/torvalds/linux/blob/v4.13/include/linux/net.h#L77
+        # for more details.
+        return (sock_type & 0xF) == uv.SOCK_STREAM
 
 
 cdef _is_sock_dgram(sock_type):
-    # Linux's socket.type is a bitmask that can include extra info
-    # about socket, therefore we can't do simple
-    # `sock_type == socket.SOCK_DGRAM`.
-    return (sock_type & uv.SOCK_DGRAM) == uv.SOCK_DGRAM
+    if SOCK_NONBLOCK == -1:
+        return sock_type == uv.SOCK_DGRAM
+    else:
+        # Read the comment in `_is_sock_stream`.
+        return (sock_type & 0xF) == uv.SOCK_DGRAM
 
 
 cdef isfuture(obj):
@@ -57,6 +63,16 @@ cdef isfuture(obj):
         return isinstance(obj, aio_Future)
     else:
         return aio_isfuture(obj)
+
+
+cdef inline socket_inc_io_ref(sock):
+    if isinstance(sock, socket_socket):
+        sock._io_refs += 1
+
+
+cdef inline socket_dec_io_ref(sock):
+    if isinstance(sock, socket_socket):
+        sock._decref_socketios()
 
 
 @cython.no_gc_clear
@@ -133,7 +149,8 @@ cdef class Loop:
                 <method_t>self._exec_queued_writes, self))
 
         self._ssock = self._csock = None
-        self._signal_handlers = None
+        self._signal_handlers = {}
+        self._listening_signals = False
 
         self._coroutine_wrapper_set = False
 
@@ -147,6 +164,8 @@ cdef class Loop:
 
         # Set to True when `loop.shutdown_asyncgens` is called.
         self._asyncgens_shutdown_called = False
+
+        self._servers = set()
 
     def __init__(self):
         self.set_debug((not sys_ignore_environment
@@ -207,37 +226,68 @@ cdef class Loop:
         self._debug_exception_handler_cnt = 0
 
     cdef _setup_signals(self):
+        if self._listening_signals:
+            return
+
         self._ssock, self._csock = socket_socketpair()
         self._ssock.setblocking(False)
         self._csock.setblocking(False)
         try:
             signal_set_wakeup_fd(self._csock.fileno())
-        except ValueError:
+        except (OSError, ValueError):
             # Not the main thread
             self._ssock.close()
             self._csock.close()
             self._ssock = self._csock = None
             return
 
+        self._listening_signals = True
+
+    cdef _recv_signals_start(self):
+        if self._ssock is None:
+            self._setup_signals()
+            if self._ssock is None:
+                # Not the main thread.
+                return
+
         self._add_reader(
-            self._ssock.fileno(),
+            self._ssock,
             new_MethodHandle(
                 self,
                 "Loop._read_from_self",
                 <method_t>self._read_from_self,
                 self))
 
-        self._signal_handlers = {}
+    cdef _recv_signals_stop(self):
+        if self._ssock is None:
+            return
+
+        self._remove_reader(self._ssock)
 
     cdef _shutdown_signals(self):
-        if self._signal_handlers is None:
+        if not self._listening_signals:
             return
+
         for sig in list(self._signal_handlers):
             self.remove_signal_handler(sig)
-        signal_set_wakeup_fd(-1)
-        self._remove_reader(self._ssock.fileno())
+
+        if not self._listening_signals:
+            # `remove_signal_handler` will call `_shutdown_signals` when
+            # removing last signal handler.
+            return
+
+        try:
+            signal_set_wakeup_fd(-1)
+        except (ValueError, OSError) as exc:
+            aio_logger.info('set_wakeup_fd(-1) failed: %s', exc)
+
+        self._remove_reader(self._ssock)
         self._ssock.close()
         self._csock.close()
+        self._ssock = None
+        self._csock = None
+
+        self._listening_signals = False
 
     cdef _read_from_self(self):
         while True:
@@ -274,7 +324,7 @@ cdef class Loop:
             _noop.noop()
             return
 
-        if handle.cancelled:
+        if handle._cancelled:
             self.remove_signal_handler(sig)  # Remove it properly.
         else:
             self._call_soon_handle(handle)
@@ -295,7 +345,7 @@ cdef class Loop:
         if self._debug:
             for i from 0 <= i < ntodo:
                 handler = <Handle> popleft()
-                if handler.cancelled == 0:
+                if handler._cancelled == 0:
                     try:
                         started = time_monotonic()
                         handler._run()
@@ -306,13 +356,13 @@ cdef class Loop:
                         delta = time_monotonic() - started
                         if delta > self.slow_callback_duration:
                             aio_logger.warning(
-                                'Executing %r took %.3f seconds',
-                                handler, delta)
+                                'Executing %s took %.3f seconds',
+                                handler._format_handle(), delta)
 
         else:
             for i from 0 <= i < ntodo:
                 handler = <Handle> popleft()
-                if handler.cancelled == 0:
+                if handler._cancelled == 0:
                     try:
                         handler._run()
                     except BaseException as ex:
@@ -365,9 +415,6 @@ cdef class Loop:
             raise RuntimeError(
                 'Cannot run the event loop while another loop is running')
 
-        if self._signal_handlers is None:
-            self._setup_signals()
-
         # reset _last_error
         self._last_error = None
 
@@ -378,6 +425,8 @@ cdef class Loop:
         self.handler_check__exec_writes.start()
         self.handler_idle.start()
 
+        self._recv_signals_start()
+
         if aio_set_running_loop is not None:
             aio_set_running_loop(self)
         try:
@@ -386,13 +435,15 @@ cdef class Loop:
             if aio_set_running_loop is not None:
                 aio_set_running_loop(None)
 
-        self.handler_check__exec_writes.stop()
-        self.handler_idle.stop()
+            self._recv_signals_stop()
 
-        self._thread_is_main = 0
-        self._thread_id = 0
-        self._running = 0
-        self._stopping = 0
+            self.handler_check__exec_writes.stop()
+            self.handler_idle.stop()
+
+            self._thread_is_main = 0
+            self._thread_id = 0
+            self._running = 0
+            self._stopping = 0
 
         if self._last_error is not None:
             # The loop was stopped with an error with 'loop._stop(error)' call
@@ -433,6 +484,16 @@ cdef class Loop:
         # During this run there should be no open handles,
         # so it should finish right away
         self.__run(uv.UV_RUN_DEFAULT)
+
+        if self._fd_to_writer_fileobj:
+            for fileobj in self._fd_to_writer_fileobj.values():
+                socket_dec_io_ref(fileobj)
+            self._fd_to_writer_fileobj.clear()
+
+        if self._fd_to_reader_fileobj:
+            for fileobj in self._fd_to_reader_fileobj.values():
+                socket_dec_io_ref(fileobj)
+            self._fd_to_reader_fileobj.clear()
 
         if self._timers:
             raise RuntimeError(
@@ -547,7 +608,7 @@ cdef class Loop:
                 "than the current one")
 
     cdef inline _new_future(self):
-        return future_factory(loop=self)
+        return aio_Future(loop=self)
 
     cdef _track_transport(self, UVBaseTransport transport):
         self._transports[transport._fileno()] = transport
@@ -589,7 +650,7 @@ cdef class Loop:
                     'File descriptor {!r} is used by transport {!r}'.format(
                         fd, tr))
 
-    cdef inline _add_reader(self, fileobj, Handle handle):
+    cdef _add_reader(self, fileobj, Handle handle):
         cdef:
             UVPoll poll
 
@@ -603,19 +664,28 @@ cdef class Loop:
             poll = UVPoll.new(self, fd)
             self._polls[fd] = poll
 
-        self._fd_to_reader_fileobj[fd] = fileobj
         poll.start_reading(handle)
 
-    cdef inline _remove_reader(self, fileobj):
+        old_fileobj = self._fd_to_reader_fileobj.pop(fd, None)
+        if old_fileobj is not None:
+            socket_dec_io_ref(old_fileobj)
+
+        self._fd_to_reader_fileobj[fd] = fileobj
+        socket_inc_io_ref(fileobj)
+
+    cdef _remove_reader(self, fileobj):
         cdef:
             UVPoll poll
 
-        if self._closed == 1:
-            return False
-
         fd = self._fileobj_to_fd(fileobj)
         self._ensure_fd_no_transport(fd)
-        self._fd_to_reader_fileobj.pop(fd, None)
+
+        mapped_fileobj = self._fd_to_reader_fileobj.pop(fd, None)
+        if mapped_fileobj is not None:
+            socket_dec_io_ref(mapped_fileobj)
+
+        if self._closed == 1:
+            return False
 
         try:
             poll = <UVPoll>(self._polls[fd])
@@ -626,9 +696,10 @@ cdef class Loop:
         if not poll.is_active():
             del self._polls[fd]
             poll._close()
+
         return result
 
-    cdef inline _add_writer(self, fileobj, Handle handle):
+    cdef _add_writer(self, fileobj, Handle handle):
         cdef:
             UVPoll poll
 
@@ -642,19 +713,28 @@ cdef class Loop:
             poll = UVPoll.new(self, fd)
             self._polls[fd] = poll
 
-        self._fd_to_writer_fileobj[fd] = fileobj
         poll.start_writing(handle)
 
-    cdef inline _remove_writer(self, fileobj):
+        old_fileobj = self._fd_to_writer_fileobj.pop(fd, None)
+        if old_fileobj is not None:
+            socket_dec_io_ref(old_fileobj)
+
+        self._fd_to_writer_fileobj[fd] = fileobj
+        socket_inc_io_ref(fileobj)
+
+    cdef _remove_writer(self, fileobj):
         cdef:
             UVPoll poll
 
-        if self._closed == 1:
-            return False
-
         fd = self._fileobj_to_fd(fileobj)
         self._ensure_fd_no_transport(fd)
-        self._fd_to_writer_fileobj.pop(fd, None)
+
+        mapped_fileobj = self._fd_to_writer_fileobj.pop(fd, None)
+        if mapped_fileobj is not None:
+            socket_dec_io_ref(mapped_fileobj)
+
+        if self._closed == 1:
+            return False
 
         try:
             poll = <UVPoll>(self._polls[fd])
@@ -665,6 +745,7 @@ cdef class Loop:
         if not poll.is_active():
             del self._polls[fd]
             poll._close()
+
         return result
 
     cdef _getaddrinfo(self, object host, object port,
@@ -721,15 +802,35 @@ cdef class Loop:
         nr.query(addr, flags)
         return fut
 
+    cdef _new_reader_future(self, sock):
+        def _on_cancel(fut):
+            # Check if the future was cancelled and if the socket
+            # is still open, i.e.
+            #
+            #    loop.remove_reader(sock)
+            #    sock.close()
+            #    fut.cancel()
+            #
+            # wasn't called by the user.
+            if fut.cancelled() and sock.fileno() != -1:
+                self._remove_reader(sock)
+
+        fut = self._new_future()
+        fut.add_done_callback(_on_cancel)
+        return fut
+
+    cdef _new_writer_future(self, sock):
+        def _on_cancel(fut):
+            if fut.cancelled() and sock.fileno() != -1:
+                self._remove_writer(sock)
+
+        fut = self._new_future()
+        fut.add_done_callback(_on_cancel)
+        return fut
+
     cdef _sock_recv(self, fut, sock, n):
         cdef:
             Handle handle
-            int fd
-
-        fd = sock.fileno()
-        if fut.cancelled():
-            self._remove_reader(fd)
-            return
 
         try:
             data = sock.recv(n)
@@ -739,22 +840,32 @@ cdef class Loop:
             pass
         except Exception as exc:
             fut.set_exception(exc)
-            self._remove_reader(fd)
+            self._remove_reader(sock)
         else:
             fut.set_result(data)
-            self._remove_reader(fd)
+            self._remove_reader(sock)
+
+    cdef _sock_recv_into(self, fut, sock, buf):
+        cdef:
+            Handle handle
+
+        try:
+            data = sock.recv_into(buf)
+        except (BlockingIOError, InterruptedError):
+            # No need to re-add the reader, let's just wait until
+            # the poll handler calls this callback again.
+            pass
+        except Exception as exc:
+            fut.set_exception(exc)
+            self._remove_reader(sock)
+        else:
+            fut.set_result(data)
+            self._remove_reader(sock)
 
     cdef _sock_sendall(self, fut, sock, data):
         cdef:
             Handle handle
             int n
-            int fd
-
-        fd = sock.fileno()
-
-        if fut.cancelled():
-            self._remove_writer(fd)
-            return
 
         try:
             n = sock.send(data)
@@ -763,12 +874,13 @@ cdef class Loop:
             return
         except Exception as exc:
             fut.set_exception(exc)
-            self._remove_writer(fd)
+            self._remove_writer(sock)
             return
+
+        self._remove_writer(sock)
 
         if n == len(data):
             fut.set_result(None)
-            self._remove_writer(fd)
         else:
             if n:
                 if not isinstance(data, memoryview):
@@ -782,17 +894,11 @@ cdef class Loop:
                 self,
                 fut, sock, data)
 
-            self._add_writer(fd, handle)
+            self._add_writer(sock, handle)
 
     cdef _sock_accept(self, fut, sock):
         cdef:
             Handle handle
-
-        fd = sock.fileno()
-
-        if fut.cancelled():
-            self._remove_reader(fd)
-            return
 
         try:
             conn, address = sock.accept()
@@ -803,37 +909,34 @@ cdef class Loop:
             pass
         except Exception as exc:
             fut.set_exception(exc)
-            self._remove_reader(fd)
+            self._remove_reader(sock)
         else:
             fut.set_result((conn, address))
-            self._remove_reader(fd)
+            self._remove_reader(sock)
 
-    cdef _sock_connect(self, fut, sock, address):
+    cdef _sock_connect(self, sock, address):
         cdef:
             Handle handle
 
-        fd = sock.fileno()
         try:
             sock.connect(address)
         except (BlockingIOError, InterruptedError):
-            # Issue #23618: When the C function connect() fails with EINTR, the
-            # connection runs in background. We have to wait until the socket
-            # becomes writable to be notified when the connection succeed or
-            # fails.
-            fut.add_done_callback(lambda fut: self._remove_writer(fd))
-
-            handle = new_MethodHandle3(
-                self,
-                "Loop._sock_connect",
-                <method3_t>self._sock_connect_cb,
-                self,
-                fut, sock, address)
-
-            self._add_writer(fd, handle)
-        except Exception as exc:
-            fut.set_exception(exc)
+            pass
         else:
-            fut.set_result(None)
+            return
+
+        fut = self._new_future()
+        fut.add_done_callback(lambda fut: self._remove_writer(sock))
+
+        handle = new_MethodHandle3(
+            self,
+            "Loop._sock_connect",
+            <method3_t>self._sock_connect_cb,
+            self,
+            fut, sock, address)
+
+        self._add_writer(sock, handle)
+        return fut
 
     cdef _sock_connect_cb(self, fut, sock, address):
         if fut.cancelled():
@@ -937,13 +1040,10 @@ cdef class Loop:
         """This method is used by uvloop tests and is not part of the API."""
         return uv.uv_backend_fd(self.uvloop)
 
-    def print_debug_info(self):
+    cdef _print_debug_info(self):
         cdef:
             int err
             uv.uv_rusage_t rusage
-
-        if not UVLOOP_DEBUG:
-            raise NotImplementedError
 
         err = uv.uv_getrusage(&rusage)
         if err < 0:
@@ -1033,6 +1133,13 @@ cdef class Loop:
             self._sock_try_write_total))
 
         print(flush=True)
+
+    property print_debug_info:
+        def __get__(self):
+            if UVLOOP_DEBUG:
+                return lambda: self._print_debug_info()
+            else:
+                raise AttributeError('print_debug_info')
 
     # Public API
 
@@ -1194,7 +1301,7 @@ cdef class Loop:
         """
         self._check_closed()
         if self._task_factory is None:
-            task = task_factory(coro, loop=self)
+            task = aio_Task(coro, loop=self)
         else:
             task = self._task_factory(self, coro)
         return task
@@ -1436,21 +1543,24 @@ cdef class Loop:
                 raise ValueError(
                     'A Stream Socket was expected, got {!r}'.format(sock))
 
+            # libuv will set the socket to non-blocking mode, but
+            # we want Python socket object to notice that.
+            sock.setblocking(False)
+
             tcp = TCPServer.new(self, protocol_factory, server, ssl,
                                 uv.AF_UNSPEC)
 
-            # See a comment on os_dup in create_connection
-            fileno = os_dup(sock.fileno())
             try:
-                tcp._open(fileno)
-                tcp._attach_fileobj(sock)
+                tcp._open(sock.fileno())
                 tcp.listen(backlog)
             except:
                 tcp._close()
                 raise
 
+            tcp._attach_fileobj(sock)
             server._add_server(tcp)
 
+        server._ref()
         return server
 
     async def create_connection(self, protocol_factory, host=None, port=None, *,
@@ -1521,11 +1631,10 @@ cdef class Loop:
             fs = []
             f1 = f2 = None
 
-            try:
-                __static_getaddrinfo(
+            addr = __static_getaddrinfo(
                     host, port, family, uv.SOCK_STREAM,
                     proto, <system.sockaddr*>&rai_addr_static)
-            except LookupError:
+            if addr is None:
                 f1 = self._getaddrinfo(
                     host, port, family,
                     uv.SOCK_STREAM, proto, flags,
@@ -1543,12 +1652,11 @@ cdef class Loop:
                     raise ValueError(
                         'local_addr must be a tuple of host and port')
 
-                try:
-                    __static_getaddrinfo(
-                        local_addr[0], local_addr[1],
-                        family, uv.SOCK_STREAM,
-                        proto, <system.sockaddr*>&lai_addr_static)
-                except LookupError:
+                addr = __static_getaddrinfo(
+                    local_addr[0], local_addr[1],
+                    family, uv.SOCK_STREAM,
+                    proto, <system.sockaddr*>&lai_addr_static)
+                if addr is None:
                     f2 = self._getaddrinfo(
                         local_addr[0], local_addr[1], family,
                         uv.SOCK_STREAM, proto, flags,
@@ -1635,45 +1743,27 @@ cdef class Loop:
                 raise ValueError(
                     'A Stream Socket was expected, got {!r}'.format(sock))
 
+            # libuv will set the socket to non-blocking mode, but
+            # we want Python socket object to notice that.
+            sock.setblocking(False)
+
             waiter = self._new_future()
             tr = TCPTransport.new(self, protocol, None, waiter)
             try:
-                # Why we use os.dup here and other places
-                # ---------------------------------------
-                #
-                # Prerequisite: in Python 3.6, Python Socket Objects (PSO)
-                # were fixed to raise an OSError if the `socket.close()` call
-                # failed.  So if the underlying FD is already closed,
-                # `socket.close()` call will fail with OSError(EBADF).
-                #
-                # Problem:
-                #
-                #   - Vanilla asyncio uses the passed PSO directly.  When the
-                #     transport eventually closes the PSO, the PSO is marked as
-                #     'closed'.  If the user decides to close the PSO after
-                #     closing the loop, everything works normal in Python 3.5
-                #     and 3.6.
-                #
-                #   - asyncio+uvloop unwraps the FD from the passed PSO.
-                #     Eventually the transport is closed and so the FD.
-                #     If the user decides to close the PSO after closing the
-                #     loop, an OSError(EBADF) will be raised in Python 3.6.
-                #
-                # All in all, duping FDs makes sense, because uvloop
-                # (and libuv) manage the FD once the user passes a PSO to
-                # `loop.create_connection`.  We don't want the user to have
-                # any control of the FD once it is passed to uvloop.
-                # See also: https://github.com/python/asyncio/pull/449
-                fileno = os_dup(sock.fileno())
-
                 # libuv will make socket non-blocking
-                tr._open(fileno)
-                tr._attach_fileobj(sock)
+                tr._open(sock.fileno())
                 tr._init_protocol()
                 await waiter
             except:
+                # It's OK to call `_close()` here, as opposed to
+                # `_force_close()` or `close()` as we want to terminate the
+                # transport immediately.  The `waiter` can only be waken
+                # up in `Transport._call_connection_made()`, and calling
+                # `_close()` before it is fine.
                 tr._close()
                 raise
+
+            tr._attach_fileobj(sock)
 
         if ssl:
             await ssl_waiter
@@ -1681,7 +1771,7 @@ cdef class Loop:
         else:
             return tr, protocol
 
-    async def create_unix_server(self, protocol_factory, str path=None,
+    async def create_unix_server(self, protocol_factory, path=None,
                                  *, backlog=100, sock=None, ssl=None):
         """A coroutine which creates a UNIX Domain Socket server.
 
@@ -1711,6 +1801,32 @@ cdef class Loop:
             if sock is not None:
                 raise ValueError(
                     'path and sock can not be specified at the same time')
+            orig_path = path
+
+            try:
+                # Lookup __fspath__ manually, as os.fspath() isn't
+                # available on Python 3.5.
+                fspath = type(path).__fspath__
+            except AttributeError:
+                pass
+            else:
+                path = fspath(path)
+
+            if isinstance(path, str):
+                path = PyUnicode_EncodeFSDefault(path)
+
+            # Check for abstract socket.
+            if path[0] != 0:
+                try:
+                    if stat_S_ISSOCK(os_stat(path).st_mode):
+                        os_remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as err:
+                    # Directory may have permissions only to create socket.
+                    aio_logger.error(
+                        'Unable to check or remove stale UNIX socket %r: %r',
+                        orig_path, err)
 
             # We use Python sockets to create a UNIX server socket because
             # when UNIX sockets are created by libuv, libuv removes the path
@@ -1725,7 +1841,7 @@ cdef class Loop:
                 if exc.errno == errno.EADDRINUSE:
                     # Let's improve the error message by adding
                     # with what exact address it occurs.
-                    msg = 'Address {!r} is already in use'.format(path)
+                    msg = 'Address {!r} is already in use'.format(orig_path)
                     raise OSError(errno.EADDRINUSE, msg) from None
                 else:
                     raise
@@ -1743,19 +1859,18 @@ cdef class Loop:
                     'A UNIX Domain Stream Socket was expected, got {!r}'
                     .format(sock))
 
+            # libuv will set the socket to non-blocking mode, but
+            # we want Python socket object to notice that.
+            sock.setblocking(False)
+
         pipe = UnixServer.new(self, protocol_factory, server, ssl)
 
         try:
-            # See a comment on os_dup in create_connection
-            fileno = os_dup(sock.fileno())
-
-            pipe._open(fileno)
+            pipe._open(sock.fileno())
         except:
             pipe._close()
             sock.close()
             raise
-
-        pipe._attach_fileobj(sock)
 
         try:
             pipe.listen(backlog)
@@ -1763,10 +1878,11 @@ cdef class Loop:
             pipe._close()
             raise
 
+        pipe._attach_fileobj(sock)
         server._add_server(pipe)
         return server
 
-    async def create_unix_connection(self, protocol_factory, path, *,
+    async def create_unix_connection(self, protocol_factory, path=None, *,
                                      ssl=None, sock=None,
                                      server_hostname=None):
 
@@ -1793,12 +1909,21 @@ cdef class Loop:
                 raise ValueError('server_hostname is only meaningful with ssl')
 
         if path is not None:
-            if isinstance(path, str):
-                path = PyUnicode_EncodeFSDefault(path)
-
             if sock is not None:
                 raise ValueError(
                     'path and sock can not be specified at the same time')
+
+            try:
+                # Lookup __fspath__ manually, as os.fspath() isn't
+                # available on Python 3.5.
+                fspath = type(path).__fspath__
+            except AttributeError:
+                pass
+            else:
+                path = fspath(path)
+
+            if isinstance(path, str):
+                path = PyUnicode_EncodeFSDefault(path)
 
             waiter = self._new_future()
             tr = UnixTransport.new(self, protocol, None, waiter)
@@ -1818,20 +1943,21 @@ cdef class Loop:
                     'A UNIX Domain Stream Socket was expected, got {!r}'
                     .format(sock))
 
+            # libuv will set the socket to non-blocking mode, but
+            # we want Python socket object to notice that.
+            sock.setblocking(False)
+
             waiter = self._new_future()
             tr = UnixTransport.new(self, protocol, None, waiter)
             try:
-                # See a comment on os_dup in create_connection
-                fileno = os_dup(sock.fileno())
-
-                # libuv will make socket non-blocking
-                tr._open(fileno)
-                tr._attach_fileobj(sock)
+                tr._open(sock.fileno())
                 tr._init_protocol()
                 await waiter
             except:
                 tr._close()
                 raise
+
+            tr._attach_fileobj(sock)
 
         if ssl:
             await ssl_waiter
@@ -1982,12 +2108,11 @@ cdef class Loop:
         """
         cdef:
             Handle handle
-            int fd
 
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
 
-        fut = self._new_future()
+        fut = self._new_reader_future(sock)
         handle = new_MethodHandle3(
             self,
             "Loop._sock_recv",
@@ -1995,8 +2120,32 @@ cdef class Loop:
             self,
             fut, sock, n)
 
-        fd = sock.fileno()
-        self._add_reader(fd, handle)
+        self._add_reader(sock, handle)
+        return fut
+
+    def sock_recv_into(self, sock, buf):
+        """Receive data from the socket.
+
+        The received data is written into *buf* (a writable buffer).
+        The return value is the number of bytes written.
+
+        This method is a coroutine.
+        """
+        cdef:
+            Handle handle
+
+        if self._debug and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
+
+        fut = self._new_reader_future(sock)
+        handle = new_MethodHandle3(
+            self,
+            "Loop._sock_recv_into",
+            <method3_t>self._sock_recv_into,
+            self,
+            fut, sock, buf)
+
+        self._add_reader(sock, handle)
         return fut
 
     async def sock_sendall(self, sock, data):
@@ -2013,7 +2162,6 @@ cdef class Loop:
         cdef:
             Handle handle
             int n
-            int fd
 
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
@@ -2021,33 +2169,36 @@ cdef class Loop:
         if not data:
             return
 
+        socket_inc_io_ref(sock)
         try:
-            n = sock.send(data)
-        except (BlockingIOError, InterruptedError):
-            pass
-        else:
-            if UVLOOP_DEBUG:
-                # This can be a partial success, i.e. only part
-                # of the data was sent
-                self._sock_try_write_total += 1
+            try:
+                n = sock.send(data)
+            except (BlockingIOError, InterruptedError):
+                pass
+            else:
+                if UVLOOP_DEBUG:
+                    # This can be a partial success, i.e. only part
+                    # of the data was sent
+                    self._sock_try_write_total += 1
 
-            if n == len(data):
-                return
-            if not isinstance(data, memoryview):
-                data = memoryview(data)
-            data = data[n:]
+                if n == len(data):
+                    return
+                if not isinstance(data, memoryview):
+                    data = memoryview(data)
+                data = data[n:]
 
-        fut = self._new_future()
-        handle = new_MethodHandle3(
-            self,
-            "Loop._sock_sendall",
-            <method3_t>self._sock_sendall,
-            self,
-            fut, sock, data)
+            fut = self._new_writer_future(sock)
+            handle = new_MethodHandle3(
+                self,
+                "Loop._sock_sendall",
+                <method3_t>self._sock_sendall,
+                self,
+                fut, sock, data)
 
-        fd = sock.fileno()
-        self._add_writer(fd, handle)
-        return await fut
+            self._add_writer(sock, handle)
+            return await fut
+        finally:
+            socket_dec_io_ref(sock)
 
     def sock_accept(self, sock):
         """Accept a connection.
@@ -2061,12 +2212,11 @@ cdef class Loop:
         """
         cdef:
             Handle handle
-            int fd
 
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
 
-        fut = self._new_future()
+        fut = self._new_reader_future(sock)
         handle = new_MethodHandle2(
             self,
             "Loop._sock_accept",
@@ -2074,8 +2224,7 @@ cdef class Loop:
             self,
             fut, sock)
 
-        fd = sock.fileno()
-        self._add_reader(fd, handle)
+        self._add_reader(sock, handle)
         return fut
 
     async def sock_connect(self, sock, address):
@@ -2086,15 +2235,17 @@ cdef class Loop:
         if self._debug and sock.gettimeout() != 0:
             raise ValueError("the socket must be non-blocking")
 
-        fut = self._new_future()
-        if sock.family == uv.AF_UNIX:
-            self._sock_connect(fut, sock, address)
-            await fut
-            return
-
-        _, _, _, _, address = (await self.getaddrinfo(*address))[0]
-        self._sock_connect(fut, sock, address)
-        await fut
+        socket_inc_io_ref(sock)
+        try:
+            if sock.family == uv.AF_UNIX:
+                fut = self._sock_connect(sock, address)
+            else:
+                _, _, _, _, address = (await self.getaddrinfo(*address[:2]))[0]
+                fut = self._sock_connect(sock, address)
+            if fut is not None:
+                await fut
+        finally:
+            socket_dec_io_ref(sock)
 
     async def connect_accepted_socket(self, protocol_factory, sock, *,
                                       ssl=None):
@@ -2115,9 +2266,6 @@ cdef class Loop:
         if not _is_sock_stream(sock.type):
             raise ValueError(
                 'A Stream Socket was expected, got {!r}'.format(sock))
-
-        # See a comment on os_dup in create_connection
-        fileno = os_dup(sock.fileno())
 
         app_protocol = protocol_factory()
         waiter = self._new_future()
@@ -2144,11 +2292,16 @@ cdef class Loop:
             raise ValueError(
                 'invalid socket family, expected AF_UNIX, AF_INET or AF_INET6')
 
-        transport._open(fileno)
+        transport._open(sock.fileno())
         transport._init_protocol()
+        transport._attach_fileobj(sock)
 
         await waiter
-        return transport, protocol
+
+        if ssl:
+            return protocol._app_transport, protocol
+        else:
+            return transport, protocol
 
     def run_in_executor(self, executor, func, *args):
         if aio_iscoroutine(func) or aio_iscoroutinefunction(func):
@@ -2162,9 +2315,7 @@ cdef class Loop:
                 executor = cc_ThreadPoolExecutor()
                 self._default_executor = executor
 
-        new_fut = self._new_future()
-        _chain_future(executor.submit(func, *args), new_fut)
-        return new_fut
+        return aio_wrap_future(executor.submit(func, *args), loop=self)
 
     def set_default_executor(self, executor):
         self._default_executor = executor
@@ -2264,21 +2415,19 @@ cdef class Loop:
         ReadTransport interface."""
         cdef:
             ReadUnixTransport transp
-            # See a comment on os_dup in create_connection
-            int fileno = os_dup(pipe.fileno())
 
         waiter = self._new_future()
         proto = proto_factory()
         transp = ReadUnixTransport.new(self, proto, None, waiter)
         transp._add_extra_info('pipe', pipe)
-        transp._attach_fileobj(pipe)
         try:
-            transp._open(fileno)
+            transp._open(pipe.fileno())
             transp._init_protocol()
             await waiter
         except:
             transp.close()
             raise
+        transp._attach_fileobj(pipe)
         return transp, proto
 
     async def connect_write_pipe(self, proto_factory, pipe):
@@ -2290,21 +2439,19 @@ cdef class Loop:
         WriteTransport interface."""
         cdef:
             WriteUnixTransport transp
-            # See a comment on os_dup in create_connection
-            int fileno = os_dup(pipe.fileno())
 
         waiter = self._new_future()
         proto = proto_factory()
         transp = WriteUnixTransport.new(self, proto, None, waiter)
         transp._add_extra_info('pipe', pipe)
-        transp._attach_fileobj(pipe)
         try:
-            transp._open(fileno)
+            transp._open(pipe.fileno())
             transp._init_protocol()
             await waiter
         except:
             transp.close()
             raise
+        transp._attach_fileobj(pipe)
         return transp, proto
 
     def add_signal_handler(self, sig, callback, *args):
@@ -2316,9 +2463,9 @@ cdef class Loop:
         cdef:
             Handle h
 
-        if self._signal_handlers is None:
+        if not self._listening_signals:
             self._setup_signals()
-            if self._signal_handlers is None:
+            if not self._listening_signals:
                 raise ValueError('set_wakeup_fd only works in main thread')
 
         if (aio_iscoroutine(callback)
@@ -2342,9 +2489,20 @@ cdef class Loop:
         self._signal_handlers[sig] = h
 
         try:
+            # Register a dummy signal handler to ask Python to write the signal
+            # number in the wakeup file descriptor.
             signal_signal(sig, _sighandler_noop)
+
+            # Set SA_RESTART to limit EINTR occurrences.
+            signal_siginterrupt(sig, False)
         except OSError as exc:
             del self._signal_handlers[sig]
+            if not self._signal_handlers:
+                try:
+                    signal_set_wakeup_fd(-1)
+                except (ValueError, OSError) as nexc:
+                    aio_logger.info('set_wakeup_fd(-1) failed: %s', nexc)
+
             if exc.errno == errno_EINVAL:
                 raise RuntimeError('sig {} cannot be caught'.format(sig))
             else:
@@ -2357,7 +2515,7 @@ cdef class Loop:
         """
         self._check_signal(sig)
 
-        if self._signal_handlers is None:
+        if not self._listening_signals:
             return False
 
         try:
@@ -2377,6 +2535,9 @@ cdef class Loop:
                 raise RuntimeError('sig {} cannot be caught'.format(sig))
             else:
                 raise
+
+        if not self._signal_handlers:
+            self._shutdown_signals()
 
         return True
 
@@ -2415,8 +2576,7 @@ cdef class Loop:
         """
         cdef:
             UDPTransport udp = None
-            system.addrinfo * lai
-            system.addrinfo * rai
+            system.sockaddr_storage rai
 
         if sock is not None:
             if not _is_sock_dgram(sock.type):
@@ -2436,103 +2596,83 @@ cdef class Loop:
                     'socket modifier keyword arguments can not be used '
                     'when sock is specified. ({})'.format(problems))
             sock.setblocking(False)
-            udp = UDPTransport.__new__(UDPTransport)
-            udp._init(self, uv.AF_UNSPEC)
-            udp.open(sock.family, os_dup(sock.fileno()))
-            udp._attach_fileobj(sock)
+            udp = UDPTransport.new(self, sock, None)
         else:
-            reuse_address = bool(reuse_address)
-            reuse_port = bool(reuse_port)
-            if reuse_port and not has_SO_REUSEPORT:
-                raise ValueError(
-                    'reuse_port not supported by socket module')
-
-            lads = None
-            if local_addr is not None:
-                if (not isinstance(local_addr, (tuple, list)) or
-                        len(local_addr) != 2):
-                    raise TypeError(
-                        'local_addr must be a tuple of (host, port)')
-                lads = await self._getaddrinfo(
-                    local_addr[0], local_addr[1],
-                    family, uv.SOCK_DGRAM, proto, flags,
-                    0)
-
-            rads = None
-            if remote_addr is not None:
-                if (not isinstance(remote_addr, (tuple, list)) or
-                        len(remote_addr) != 2):
-                    raise TypeError(
-                        'remote_addr must be a tuple of (host, port)')
-                rads = await self._getaddrinfo(
-                    remote_addr[0], remote_addr[1],
-                    family, uv.SOCK_DGRAM, proto, flags,
-                    0)
-
-            excs = []
-            if lads is None:
-                if rads is not None:
-                    udp = UDPTransport.__new__(UDPTransport)
-                    rai = (<AddrInfo>rads).data
-                    udp._init(self, rai.ai_family)
-                    udp._set_remote_address(rai.ai_addr, rai.ai_addrlen)
-                else:
-                    if family not in (uv.AF_INET, uv.AF_INET6):
-                        raise ValueError('unexpected address family')
-                    udp = UDPTransport.__new__(UDPTransport)
-                    udp._init(self, family)
-
-                if reuse_port:
-                    self._sock_set_reuseport(udp._fileno())
-
-                socket = udp._get_socket()
-                if family == uv.AF_INET6:
-                    socket.bind(('::', 0))
-                else:
-                    socket.bind(('0.0.0.0', 0))
+            if not (local_addr or remote_addr):
+                if family == 0:
+                    raise ValueError('unexpected address family')
+                addr_pairs_info = (((family, proto), (None, None)),)
+            elif family == uv.AF_UNIX:
+                for addr in (local_addr, remote_addr):
+                    if addr is not None and not isinstance(addr, str):
+                        raise TypeError('string is expected')
+                addr_pairs_info = (((family, proto),
+                                    (local_addr, remote_addr)), )
             else:
-                lai = (<AddrInfo>lads).data
-                while lai is not NULL:
-                    try:
-                        udp = UDPTransport.__new__(UDPTransport)
-                        udp._init(self, lai.ai_family)
-                        if reuse_port:
-                            self._sock_set_reuseport(udp._fileno())
-                        udp._bind(lai.ai_addr, reuse_address)
-                    except Exception as ex:
-                        lai = lai.ai_next
-                        excs.append(ex)
-                        continue
-                    else:
-                        break
+                # join address by (family, protocol)
+                addr_infos = col_OrderedDict()
+                for idx, addr in ((0, local_addr), (1, remote_addr)):
+                    if addr is not None:
+                        assert isinstance(addr, tuple) and len(addr) == 2, (
+                            '2-tuple is expected')
+
+                        infos = await self.getaddrinfo(
+                            *addr[:2], family=family, type=uv.SOCK_DGRAM,
+                            proto=proto, flags=flags)
+
+                        if not infos:
+                            raise OSError('getaddrinfo() returned empty list')
+
+                        for fam, _, pro, _, address in infos:
+                            key = (fam, pro)
+                            if key not in addr_infos:
+                                addr_infos[key] = [None, None]
+                            addr_infos[key][idx] = address
+
+                # each addr has to have info for each (family, proto) pair
+                addr_pairs_info = [
+                    (key, addr_pair) for key, addr_pair in addr_infos.items()
+                    if not ((local_addr and addr_pair[0] is None) or
+                            (remote_addr and addr_pair[1] is None))]
+
+                if not addr_pairs_info:
+                    raise ValueError('can not get address information')
+
+            exceptions = []
+            for ((family, proto),
+                 (local_address, remote_address)) in addr_pairs_info:
+                sock = None
+                r_addr = None
+                try:
+                    sock = socket_socket(
+                        family=family, type=uv.SOCK_DGRAM, proto=proto)
+                    if reuse_address:
+                        sock.setsockopt(
+                            uv.SOL_SOCKET, uv.SO_REUSEADDR, 1)
+                    if reuse_port:
+                        self._sock_set_reuseport(sock.fileno())
+                    if allow_broadcast:
+                        sock.setsockopt(uv.SOL_SOCKET, SO_BROADCAST, 1)
+                    sock.setblocking(False)
+                    if local_addr:
+                        sock.bind(local_address)
+                    if remote_addr:
+                        await self.sock_connect(sock, remote_address)
+                        r_addr = remote_address
+                except OSError as exc:
+                    if sock is not None:
+                        sock.close()
+                    exceptions.append(exc)
+                except:
+                    if sock is not None:
+                        sock.close()
+                    raise
                 else:
-                    ctx = None
-                    if len(excs):
-                        ctx = excs[0]
-                    raise OSError('could not bind to local_addr {}'.format(
-                        local_addr)) from ctx
+                    break
+            else:
+                raise exceptions[0]
 
-                if rads is not None:
-                    rai = (<AddrInfo>rads).data
-                    sock = udp._get_socket()
-                    while rai is not NULL:
-                        if rai.ai_family != lai.ai_family:
-                            rai = rai.ai_next
-                            continue
-                        if rai.ai_protocol != lai.ai_protocol:
-                            rai = rai.ai_next
-                            continue
-                        udp._set_remote_address(rai.ai_addr, rai.ai_addrlen)
-                        break
-                    else:
-                        raise OSError(
-                            'could not bind to remote_addr {}'.format(
-                                remote_addr))
-
-                    udp._set_remote_address(rai.ai_addr, rai.ai_addrlen)
-
-        if allow_broadcast:
-            udp._set_broadcast(1)
+            udp = UDPTransport.new(self, sock, r_addr)
 
         protocol = protocol_factory()
         waiter = self._new_future()
@@ -2611,6 +2751,7 @@ cdef inline void __loop_free_buffer(Loop loop):
 
 
 include "cbhandles.pyx"
+include "pseudosock.pyx"
 
 include "handles/handle.pyx"
 include "handles/async_.pyx"
@@ -2631,9 +2772,6 @@ include "dns.pyx"
 include "handles/udp.pyx"
 
 include "server.pyx"
-
-include "future.pyx"
-include "chain_futs.pyx"
 
 
 # Used in UVProcess

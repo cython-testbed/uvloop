@@ -1,4 +1,7 @@
 cdef __port_to_int(port, proto):
+    if type(port) is int:
+        return port
+
     if port is None or port == '' or port == b'':
         return 0
 
@@ -134,39 +137,43 @@ cdef __static_getaddrinfo(object host, object port,
                           system.sockaddr *addr):
 
     if proto not in {0, uv.IPPROTO_TCP, uv.IPPROTO_UDP}:
-        raise LookupError
+        return
 
-    if type == uv.SOCK_STREAM:
-        # Linux only:
-        #    getaddrinfo() can raise when socket.type is a bit mask.
-        #    So if socket.type is a bit mask of SOCK_STREAM, and say
-        #    SOCK_NONBLOCK, we simply return None, which will trigger
-        #    a call to getaddrinfo() letting it process this request.
+    if _is_sock_stream(type):
         proto = uv.IPPROTO_TCP
-    elif type == uv.SOCK_DGRAM:
+    elif _is_sock_dgram(type):
         proto = uv.IPPROTO_UDP
     else:
-        raise LookupError
+        return
 
     try:
         port = __port_to_int(port, proto)
     except:
-        raise LookupError
+        return
 
+    hp = (host, port)
     if family == uv.AF_UNSPEC:
-        afs = [uv.AF_INET, uv.AF_INET6]
-    else:
-        afs = [family]
-
-    for af in afs:
         try:
-            __convert_pyaddr_to_sockaddr(af, (host, port), addr)
-        except:
-            continue
+            __convert_pyaddr_to_sockaddr(uv.AF_INET, hp, addr)
+        except Exception:
+            pass
         else:
-            return (af, type, proto)
+            return (uv.AF_INET, type, proto)
 
-    raise LookupError
+        try:
+            __convert_pyaddr_to_sockaddr(uv.AF_INET6, hp, addr)
+        except Exception:
+            pass
+        else:
+            return (uv.AF_INET6, type, proto)
+
+    else:
+        try:
+            __convert_pyaddr_to_sockaddr(family, hp, addr)
+        except Exception:
+            pass
+        else:
+            return (family, type, proto)
 
 
 cdef __static_getaddrinfo_pyaddr(object host, object port,
@@ -175,13 +182,15 @@ cdef __static_getaddrinfo_pyaddr(object host, object port,
 
     cdef:
         system.sockaddr_storage addr
+        object triplet
 
-    try:
-        (af, type, proto) = __static_getaddrinfo(
-            host, port, family, type,
-            proto, <system.sockaddr*>&addr)
-    except LookupError:
+    triplet = __static_getaddrinfo(
+        host, port, family, type,
+        proto, <system.sockaddr*>&addr)
+    if triplet is None:
         return
+
+    af, type, proto = triplet
 
     try:
         pyaddr = __convert_sockaddr_to_pyaddr(<system.sockaddr*>&addr)
@@ -240,6 +249,7 @@ cdef class AddrInfoRequest(UVRequest):
     cdef:
         system.addrinfo hints
         object callback
+        uv.uv_getaddrinfo_t _req_data
 
     def __cinit__(self, Loop loop,
                   bytes host, bytes port,
@@ -274,12 +284,7 @@ cdef class AddrInfoRequest(UVRequest):
         self.hints.ai_socktype = type
         self.hints.ai_protocol = proto
 
-        self.request = <uv.uv_req_t*> PyMem_RawMalloc(
-            sizeof(uv.uv_getaddrinfo_t))
-        if self.request is NULL:
-            self.on_done()
-            raise MemoryError()
-
+        self.request = <uv.uv_req_t*> &self._req_data
         self.callback = callback
         self.request.data = <void*>self
 
@@ -298,14 +303,10 @@ cdef class AddrInfoRequest(UVRequest):
 cdef class NameInfoRequest(UVRequest):
     cdef:
         object callback
+        uv.uv_getnameinfo_t _req_data
 
     def __cinit__(self, Loop loop, callback):
-        self.request = <uv.uv_req_t*> PyMem_RawMalloc(
-            sizeof(uv.uv_getnameinfo_t))
-        if self.request is NULL:
-            self.on_done()
-            raise MemoryError()
-
+        self.request = <uv.uv_req_t*> &self._req_data
         self.callback = callback
         self.request.data = <void*>self
 

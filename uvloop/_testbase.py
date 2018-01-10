@@ -6,14 +6,16 @@ import asyncio.events
 import collections
 import contextlib
 import gc
-import inspect
 import logging
 import os
+import pprint
 import re
+import select
 import socket
 import ssl
 import tempfile
 import threading
+import time
 import unittest
 import uvloop
 
@@ -67,10 +69,20 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
     def is_asyncio_loop(self):
         return type(self.loop).__module__.startswith('asyncio.')
 
+    def run_loop_briefly(self, *, delay=0.01):
+        self.loop.run_until_complete(asyncio.sleep(delay, loop=self.loop))
+
+    def loop_exception_handler(self, loop, context):
+        self.__unhandled_exceptions.append(context)
+        self.loop.default_exception_handler(context)
+
     def setUp(self):
         self.loop = self.new_loop()
         asyncio.set_event_loop(None)
         self._check_unclosed_resources_in_debug = True
+
+        self.loop.set_exception_handler(self.loop_exception_handler)
+        self.__unhandled_exceptions = []
 
         if hasattr(asyncio, '_get_running_loop'):
             # Disable `_get_running_loop`.
@@ -79,6 +91,12 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
 
     def tearDown(self):
         self.loop.close()
+
+        if self.__unhandled_exceptions:
+            print('Unexpected calls to loop.call_exception_handler():')
+            pprint.pprint(self.__unhandled_exceptions)
+            self.fail('unexpected calls to loop.call_exception_handler()')
+            return
 
         if hasattr(asyncio, '_get_running_loop'):
             asyncio.events._get_running_loop = self._get_running_loop
@@ -132,6 +150,77 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
 
     def skip_unclosed_handles_check(self):
         self._check_unclosed_resources_in_debug = False
+
+    def tcp_server(self, server_prog, *,
+                   family=socket.AF_INET,
+                   addr=None,
+                   timeout=5,
+                   backlog=1,
+                   max_clients=10):
+
+        if addr is None:
+            if family == socket.AF_UNIX:
+                with tempfile.NamedTemporaryFile() as tmp:
+                    addr = tmp.name
+            else:
+                addr = ('127.0.0.1', 0)
+
+        sock = socket.socket(family, socket.SOCK_STREAM)
+
+        if timeout is None:
+            raise RuntimeError('timeout is required')
+        if timeout <= 0:
+            raise RuntimeError('only blocking sockets are supported')
+        sock.settimeout(timeout)
+
+        try:
+            sock.bind(addr)
+            sock.listen(backlog)
+        except OSError as ex:
+            sock.close()
+            raise ex
+
+        return TestThreadedServer(
+            self, sock, server_prog, timeout, max_clients)
+
+    def tcp_client(self, client_prog,
+                   family=socket.AF_INET,
+                   timeout=10):
+
+        sock = socket.socket(family, socket.SOCK_STREAM)
+
+        if timeout is None:
+            raise RuntimeError('timeout is required')
+        if timeout <= 0:
+            raise RuntimeError('only blocking sockets are supported')
+        sock.settimeout(timeout)
+
+        return TestThreadedClient(
+            self, sock, client_prog, timeout)
+
+    def unix_server(self, *args, **kwargs):
+        return self.tcp_server(*args, family=socket.AF_UNIX, **kwargs)
+
+    def unix_client(self, *args, **kwargs):
+        return self.tcp_client(*args, family=socket.AF_UNIX, **kwargs)
+
+    @contextlib.contextmanager
+    def unix_sock_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            fn = os.path.join(td, 'sock')
+            try:
+                yield fn
+            finally:
+                try:
+                    os.unlink(fn)
+                except OSError:
+                    pass
+
+    def _abort_socket_test(self, ex):
+        try:
+            self.loop.stop()
+        finally:
+            self.fail(ex)
 
 
 def _cert_fullname(test_file_name, cert_file_name):
@@ -224,84 +313,65 @@ class AIOTestCase(BaseTestCase):
         return asyncio.new_event_loop()
 
 
+def has_IPv6():
+    server_sock = socket.socket(socket.AF_INET6)
+    with server_sock:
+        try:
+            server_sock.bind(('::1', 0))
+        except OSError:
+            return False
+        else:
+            return True
+
+
+has_IPv6 = has_IPv6()
+
+
 ###############################################################################
 # Socket Testing Utilities
 ###############################################################################
 
 
-def tcp_server(server_prog, *,
-               family=socket.AF_INET,
-               addr=None,
-               timeout=5,
-               backlog=1,
-               max_clients=10):
+class TestSocketWrapper:
 
-    if addr is None:
-        if family == socket.AF_UNIX:
-            with tempfile.NamedTemporaryFile() as tmp:
-                addr = tmp.name
-        else:
-            addr = ('127.0.0.1', 0)
+    def __init__(self, sock):
+        self.__sock = sock
 
-    if not inspect.isgeneratorfunction(server_prog):
-        raise TypeError('server_prog: a generator function was expected')
+    def recv_all(self, n):
+        buf = b''
+        while len(buf) < n:
+            data = self.recv(n - len(buf))
+            if data == b'':
+                raise ConnectionAbortedError
+            buf += data
+        return buf
 
-    sock = socket.socket(family, socket.SOCK_STREAM)
+    def starttls(self, ssl_context, *,
+                 server_side=False,
+                 server_hostname=None,
+                 do_handshake_on_connect=True):
 
-    if timeout is None:
-        raise RuntimeError('timeout is required')
-    if timeout <= 0:
-        raise RuntimeError('only blocking sockets are supported')
-    sock.settimeout(timeout)
+        assert isinstance(ssl_context, ssl.SSLContext)
 
-    try:
-        sock.bind(addr)
-        sock.listen(backlog)
-    except OSError as ex:
-        sock.close()
-        raise ex
+        ssl_sock = ssl_context.wrap_socket(
+            self.__sock, server_side=server_side,
+            server_hostname=server_hostname,
+            do_handshake_on_connect=do_handshake_on_connect)
 
-    srv = Server(sock, server_prog, timeout, max_clients)
-    return srv
+        if server_side:
+            ssl_sock.do_handshake()
 
+        self.__sock.close()
+        self.__sock = ssl_sock
 
-def tcp_client(client_prog,
-               family=socket.AF_INET,
-               timeout=10):
+    def __getattr__(self, name):
+        return getattr(self.__sock, name)
 
-    if not inspect.isgeneratorfunction(client_prog):
-        raise TypeError('client_prog: a generator function was expected')
-
-    sock = socket.socket(family, socket.SOCK_STREAM)
-
-    if timeout is None:
-        raise RuntimeError('timeout is required')
-    if timeout <= 0:
-        raise RuntimeError('only blocking sockets are supported')
-    sock.settimeout(timeout)
-
-    srv = Client(sock, client_prog, timeout)
-    return srv
+    def __repr__(self):
+        return '<{} {!r}>'.format(type(self).__name__, self.__sock)
 
 
-class _Runner:
-    def _iterate(self, prog, sock):
-        last_val = None
-        while self._active:
-            try:
-                command = prog.send(last_val)
-            except StopIteration:
-                return
-
-            if not isinstance(command, _Command):
-                raise TypeError(
-                    'client_prog yielded invalid command {!r}'.format(command))
-
-            command_res = command._run(sock)
-            assert isinstance(command_res, tuple) and len(command_res) == 2
-
-            last_val = command_res[1]
-            sock = command_res[0]
+class SocketThread(threading.Thread):
 
     def stop(self):
         self._active = False
@@ -315,9 +385,9 @@ class _Runner:
         self.stop()
 
 
-class Client(_Runner, threading.Thread):
+class TestThreadedClient(SocketThread):
 
-    def __init__(self, sock, prog, timeout):
+    def __init__(self, test, sock, prog, timeout):
         threading.Thread.__init__(self, None, None, 'test-client')
         self.daemon = True
 
@@ -325,16 +395,18 @@ class Client(_Runner, threading.Thread):
         self._sock = sock
         self._active = True
         self._prog = prog
+        self._test = test
 
     def run(self):
-        prog = self._prog()
-        sock = self._sock
-        self._iterate(prog, sock)
+        try:
+            self._prog(TestSocketWrapper(self._sock))
+        except Exception as ex:
+            self._test._abort_socket_test(ex)
 
 
-class Server(_Runner, threading.Thread):
+class TestThreadedServer(SocketThread):
 
-    def __init__(self, sock, prog, timeout, max_clients):
+    def __init__(self, test, sock, prog, timeout, max_clients):
         threading.Thread.__init__(self, None, None, 'test-server')
         self.daemon = True
 
@@ -347,113 +419,67 @@ class Server(_Runner, threading.Thread):
 
         self._prog = prog
 
+        self._s1, self._s2 = socket.socketpair()
+        self._s1.setblocking(False)
+
+        self._test = test
+
+    def stop(self):
+        try:
+            if self._s2 and self._s2.fileno() != -1:
+                try:
+                    self._s2.send(b'stop')
+                except OSError:
+                    pass
+        finally:
+            super().stop()
+
     def run(self):
-        with self._sock:
-            while self._active:
-                if self._clients >= self._max_clients:
-                    return
+        try:
+            with self._sock:
+                self._sock.setblocking(0)
+                self._run()
+        finally:
+            self._s1.close()
+            self._s2.close()
+
+    def _run(self):
+        while self._active:
+            if self._clients >= self._max_clients:
+                return
+
+            r, w, x = select.select(
+                [self._sock, self._s1], [], [], self._timeout)
+
+            if self._s1 in r:
+                return
+
+            if self._sock in r:
                 try:
                     conn, addr = self._sock.accept()
+                except BlockingIOError:
+                    continue
                 except socket.timeout:
                     if not self._active:
                         return
                     else:
                         raise
-                self._clients += 1
-                conn.settimeout(self._timeout)
-                try:
-                    with conn:
-                        self._handle_client(conn)
-                except Exception:
-                    self._active = False
-                    raise
+                else:
+                    self._clients += 1
+                    conn.settimeout(self._timeout)
+                    try:
+                        with conn:
+                            self._handle_client(conn)
+                    except Exception as ex:
+                        self._active = False
+                        try:
+                            raise
+                        finally:
+                            self._test._abort_socket_test(ex)
 
     def _handle_client(self, sock):
-        prog = self._prog()
-        self._iterate(prog, sock)
+        self._prog(TestSocketWrapper(sock))
 
     @property
     def addr(self):
         return self._sock.getsockname()
-
-
-class _Command:
-
-    def _run(self, sock):
-        raise NotImplementedError
-
-
-class write(_Command):
-
-    def __init__(self, data:bytes):
-        self._data = data
-
-    def _run(self, sock):
-        sock.sendall(self._data)
-        return sock, None
-
-
-class connect(_Command):
-    def __init__(self, addr):
-        self._addr = addr
-
-    def _run(self, sock):
-        sock.connect(self._addr)
-        return sock, None
-
-
-class close(_Command):
-    def _run(self, sock):
-        sock.close()
-        return sock, None
-
-
-class read(_Command):
-
-    def __init__(self, nbytes):
-        self._nbytes = nbytes
-        self._nbytes_recv = 0
-        self._data = []
-
-    def _run(self, sock):
-        while self._nbytes_recv != self._nbytes:
-            try:
-                data = sock.recv(self._nbytes)
-            except InterruptedError:
-                # for Python < 3.5
-                continue
-
-            if data == b'':
-                raise ConnectionAbortedError
-
-            self._nbytes_recv += len(data)
-            self._data.append(data)
-
-        data = b''.join(self._data)
-        return sock, data
-
-
-class starttls(_Command):
-
-    def __init__(self, ssl_context, *,
-                 server_side=False,
-                 server_hostname=None,
-                 do_handshake_on_connect=True):
-
-        assert isinstance(ssl_context, ssl.SSLContext)
-        self._ctx = ssl_context
-
-        self._server_side = server_side
-        self._server_hostname = server_hostname
-        self._do_handshake_on_connect = do_handshake_on_connect
-
-    def _run(self, sock):
-        ssl_sock = self._ctx.wrap_socket(
-            sock, server_side=self._server_side,
-            server_hostname=self._server_hostname,
-            do_handshake_on_connect=self._do_handshake_on_connect)
-
-        if self._server_side:
-            ssl_sock.do_handshake()
-
-        return ssl_sock, None

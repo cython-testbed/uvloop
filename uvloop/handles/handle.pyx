@@ -15,6 +15,7 @@ cdef class UVHandle:
     def __cinit__(self):
         self._closed = 0
         self._inited = 0
+        self._has_handle = 1
         self._handle = NULL
         self._loop = None
         self._source_traceback = None
@@ -25,6 +26,9 @@ cdef class UVHandle:
                 self.__class__.__name__))
 
     def __dealloc__(self):
+        self._dealloc_impl()
+
+    cdef _dealloc_impl(self):
         if UVLOOP_DEBUG:
             if self._loop is not None:
                 self._loop._debug_handles_current.subtract([
@@ -36,6 +40,9 @@ cdef class UVHandle:
                     .format(self.__class__.__name__))
 
         if self._handle is NULL:
+            if UVLOOP_DEBUG:
+                if self._has_handle == 0:
+                    self._loop._debug_uv_handles_freed += 1
             return
 
         # -> When we're at this point, something is wrong <-
@@ -67,7 +74,7 @@ cdef class UVHandle:
             self._closed = 1
             self._free()
 
-    cdef inline _free(self):
+    cdef _free(self):
         if self._handle == NULL:
             return
 
@@ -79,10 +86,17 @@ cdef class UVHandle:
 
     cdef _warn_unclosed(self):
         if self._source_traceback is not None:
-            tb = ''.join(tb_format_list(self._source_traceback))
-            tb = 'object created at (most recent call last):\n{}'.format(
-                tb.rstrip())
-            msg = 'unclosed resource {!r}; {}'.format(self, tb)
+            try:
+                tb = ''.join(tb_format_list(self._source_traceback))
+                tb = 'object created at (most recent call last):\n{}'.format(
+                    tb.rstrip())
+            except Exception as ex:
+                msg = (
+                    'unclosed resource {!r}; could not serialize '
+                    'debug traceback: {}: {}'
+                ).format(self, type(ex).__name__, ex)
+            else:
+                msg = 'unclosed resource {!r}; {}'.format(self, tb)
         else:
             msg = 'unclosed resource {!r}'.format(self)
         warnings_warn(msg, ResourceWarning)
@@ -90,6 +104,8 @@ cdef class UVHandle:
     cdef inline _abort_init(self):
         if self._handle is not NULL:
             self._free()
+
+        self._closed = 1
 
         if UVLOOP_DEBUG:
             name = self.__class__.__name__
@@ -100,13 +116,12 @@ cdef class UVHandle:
                 raise RuntimeError(
                     '_abort_init: {}._closed is set'.format(name))
 
-        self._closed = 1
-
     cdef inline _finish_init(self):
         self._inited = 1
-        self._handle.data = <void*>self
+        if self._has_handle == 1:
+            self._handle.data = <void*>self
         if self._loop._debug:
-            self._source_traceback = tb_extract_stack(sys_getframe(0))
+            self._source_traceback = extract_stack()
         if UVLOOP_DEBUG:
             self._loop._debug_uv_handles_total += 1
 
@@ -127,7 +142,7 @@ cdef class UVHandle:
         cdef bint res
         res = self._closed != 1 and self._inited == 1
         if UVLOOP_DEBUG:
-            if res:
+            if res and self._has_handle == 1:
                 name = self.__class__.__name__
                 if self._handle is NULL:
                     raise RuntimeError(
@@ -216,7 +231,7 @@ cdef class UVSocketHandle(UVHandle):
         self._fileobj = None
         self.__cached_socket = None
 
-    cdef inline _fileno(self):
+    cdef _fileno(self):
         cdef:
             int fd
             int err
@@ -248,28 +263,46 @@ cdef class UVSocketHandle(UVHandle):
         # When we create a TCP/PIPE/etc connection/server based on
         # a Python file object, we need to close the file object when
         # the uv handle is closed.
+        socket_inc_io_ref(file)
         self._fileobj = file
 
     cdef _close(self):
-        try:
-            if self.__cached_socket is not None:
-                self.__cached_socket.detach()
-                self.__cached_socket = None
+        if self.__cached_socket is not None:
+            (<PseudoSocket>self.__cached_socket)._fd = -1
 
+        UVHandle._close(self)
+
+        try:
+            # This code will only run for transports created from
+            # Python sockets, i.e. with `loop.create_server(sock=sock)` etc.
             if self._fileobj is not None:
-                try:
-                    self._fileobj.close()
-                except Exception as exc:
-                    self._loop.call_exception_handler({
-                        'exception': exc,
-                        'transport': self,
-                        'message': 'could not close attached file object {!r}'.
-                            format(self._fileobj)
-                    })
-                finally:
-                    self._fileobj = None
+                if isinstance(self._fileobj, socket_socket):
+                    # Detaching the socket object is the ideal solution:
+                    # * libuv will actually close the FD;
+                    # * detach() call will reset FD for the Python socket
+                    #   object, which means that it won't be closed 2nd time
+                    #   when the socket object is GCed.
+                    #
+                    # No need to call `socket_dec_io_ref()`, as
+                    # `socket.detach()` ignores `socket._io_refs`.
+                    self._fileobj.detach()
+                else:
+                    try:
+                        # `socket.close()` will raise an EBADF because libuv
+                        # has already closed the underlying FD.
+                        self._fileobj.close()
+                    except OSError as ex:
+                        if ex.errno != errno_EBADF:
+                            raise
+        except Exception as ex:
+            self._loop.call_exception_handler({
+                'exception': ex,
+                'transport': self,
+                'message': 'could not close attached file object {!r}'.
+                    format(self._fileobj)
+            })
         finally:
-            UVHandle._close(self)
+            self._fileobj = None
 
     cdef _open(self, int sockfd):
         raise NotImplementedError
@@ -325,11 +358,16 @@ cdef void __uv_close_handle_cb(uv.uv_handle_t* handle) with gil:
         PyMem_RawFree(handle)
     else:
         h = <UVHandle>handle.data
-        if UVLOOP_DEBUG:
-            h._loop._debug_handles_closed.update([
-                h.__class__.__name__])
-        h._free()
-        Py_DECREF(h) # Was INCREFed in UVHandle._close
+        try:
+            if UVLOOP_DEBUG:
+                if not h._has_handle:
+                    raise RuntimeError(
+                        'has_handle=0 in __uv_close_handle_cb')
+                h._loop._debug_handles_closed.update([
+                    h.__class__.__name__])
+            h._free()
+        finally:
+            Py_DECREF(h) # Was INCREFed in UVHandle._close
 
 
 cdef void __close_all_handles(Loop loop):
