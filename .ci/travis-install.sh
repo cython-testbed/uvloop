@@ -25,4 +25,4 @@ fi
 pip install --upgrade pip wheel
 pip install --upgrade setuptools
 pip install -r .ci/requirements.txt
-pip install --install-option="--no-cython-compile" https://github.com/cython/cython/archive/5b6497c8329c778c97f6f59f3f358304bc1ebd1e.zip
+pip install --install-option="--no-cython-compile" https://github.com/cython/cython/archive/5854d634e22bc6ea225b4298ca336b8dbbacefdf.zip
