@@ -27,14 +27,15 @@ message sizes.  The *sockets* benchmark uses ``loop.sock_recv()`` and
 ``loop.sock_sendall()`` methods; the *streams* benchmark uses asyncio
 high-level streams, created by the ``asyncio.start_server()`` function;
 and the *protocol* benchmark uses ``loop.create_server()`` with a simple
-echo protocol.  Read more about uvloop
-`performance <http://magic.io/blog/uvloop-blazing-fast-python-networking/>`_.
+echo protocol.  Read more about uvloop in a
+`blog post <http://magic.io/blog/uvloop-blazing-fast-python-networking/>`_
+about it.
 
 
 Installation
 ------------
 
-uvloop requires Python 3.5 and is available on PyPI.
+uvloop requires Python 3.5 or greater and is available on PyPI.
 Use pip to install it::
 
     $ pip install uvloop
@@ -50,31 +51,40 @@ loop policy:
 
     import asyncio
     import uvloop
+
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-Alternatively, you can create an instance of the loop
-manually, using:
 
-.. code:: python
+Building From Source
+--------------------
 
-    loop = uvloop.new_event_loop()
-    asyncio.set_event_loop(loop)
+To build uvloop, you'll need Python 3.5 or greater:
 
+1. Clone the repository:
 
-Development of uvloop
----------------------
+   .. code::
 
-To build uvloop, you'll need Cython and Python 3.5.  The best way
-is to create a virtual env, so that you'll have ``cython`` and
-``python`` commands pointing to the correct tools.
+    $ git clone --recursive git@github.com:MagicStack/uvloop.git
+    $ cd uvloop
 
-1. ``git clone --recursive git@github.com:MagicStack/uvloop.git``
+2. Create a virtual environment and activate it, for example:
 
-2. ``cd uvloop``
+   .. code::
 
-3. ``make``
+    $ python3.7 -m venv uvloop-dev
+    $ source uvloop-dev/bin/activate
 
-4. ``make test``
+3. Install development dependencies:
+
+   ..  code::
+
+    $ pip install -r requirements.dev.txt
+
+4. Build and run tests:
+
+   .. code::
+
+    $ make && make test
 
 
 License

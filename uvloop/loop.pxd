@@ -29,11 +29,14 @@ ctypedef object (*method2_t)(object, object, object)
 ctypedef object (*method3_t)(object, object, object, object)
 
 
+
 cdef class Loop:
     cdef:
         uv.uv_loop_t *uvloop
 
-        bint _coroutine_wrapper_set
+
+        bint _coroutine_debug_set
+        int _coroutine_origin_tracking_saved_depth
 
         public slow_callback_duration
 
@@ -42,7 +45,7 @@ cdef class Loop:
         bint _running
         bint _stopping
 
-        long _thread_id
+        uint64_t _thread_id
         bint _thread_is_main
 
         object _task_factory
@@ -55,9 +58,11 @@ cdef class Loop:
         set _servers
 
         object _transports
+        set _processes
         dict _fd_to_reader_fileobj
         dict _fd_to_writer_fileobj
 
+        set _signals
         dict _signal_handlers
         object _ssock
         object _csock
@@ -137,10 +142,11 @@ cdef class Loop:
     cdef inline _queue_write(self, UVStream stream)
     cdef _exec_queued_writes(self)
 
-    cdef inline _call_soon(self, object callback, object args)
+    cdef inline _call_soon(self, object callback, object args, object context)
     cdef inline _call_soon_handle(self, Handle handle)
 
-    cdef _call_later(self, uint64_t delay, object callback, object args)
+    cdef _call_later(self, uint64_t delay, object callback, object args,
+                     object context)
 
     cdef void _handle_exception(self, object ex)
 
@@ -161,18 +167,22 @@ cdef class Loop:
                         Server server,
                         object ssl,
                         bint reuse_port,
-                        object backlog)
+                        object backlog,
+                        object ssl_handshake_timeout)
 
     cdef _track_transport(self, UVBaseTransport transport)
     cdef _fileobj_to_fd(self, fileobj)
     cdef _ensure_fd_no_transport(self, fd)
 
-    cdef _new_reader_future(self, sock)
-    cdef _new_writer_future(self, sock)
+    cdef _track_process(self, UVProcess proc)
+    cdef _untrack_process(self, UVProcess proc)
+
     cdef _add_reader(self, fd, Handle handle)
+    cdef _has_reader(self, fd)
     cdef _remove_reader(self, fd)
 
     cdef _add_writer(self, fd, Handle handle)
+    cdef _has_writer(self, fd)
     cdef _remove_writer(self, fd)
 
     cdef _sock_recv(self, fut, sock, n)
@@ -192,9 +202,10 @@ cdef class Loop:
 
     cdef _handle_signal(self, sig)
     cdef _read_from_self(self)
-    cdef _process_self_data(self, data)
+    cdef inline _ceval_process_signals(self)
+    cdef _invoke_signals(self, bytes data)
 
-    cdef _set_coroutine_wrapper(self, bint enabled)
+    cdef _set_coroutine_debug(self, bint enabled)
 
     cdef _print_debug_info(self)
 

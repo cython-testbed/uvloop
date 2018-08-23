@@ -158,6 +158,9 @@ class _TestTCP:
                 loop=self.loop,
                 sock=sock)
 
+            if self.PY37:
+                self.assertIs(srv.get_loop(), self.loop)
+
             srv_socks = srv.sockets
             self.assertTrue(srv_socks)
 
@@ -317,6 +320,16 @@ class _TestTCP:
             self.assertIsNone(wsrv())
 
         self.loop.run_until_complete(test())
+
+    def test_create_server_8(self):
+        if self.implementation == 'asyncio' and not self.PY37:
+            raise unittest.SkipTest()
+
+        with self.assertRaisesRegex(
+                ValueError, 'ssl_handshake_timeout is only meaningful'):
+            self.loop.run_until_complete(
+                self.loop.create_server(
+                    lambda: None, host='::', port=0, ssl_handshake_timeout=10))
 
     def test_create_connection_open_con_addr(self):
         async def client(addr):
@@ -501,6 +514,16 @@ class _TestTCP:
                              backlog=1) as srv:
             self.loop.run_until_complete(client(srv.addr))
 
+    def test_create_connection_6(self):
+        if self.implementation == 'asyncio' and not self.PY37:
+            raise unittest.SkipTest()
+
+        with self.assertRaisesRegex(
+                ValueError, 'ssl_handshake_timeout is only meaningful'):
+            self.loop.run_until_complete(
+                self.loop.create_connection(
+                    lambda: None, host='::', port=0, ssl_handshake_timeout=10))
+
     def test_transport_shutdown(self):
         CNT = 0           # number of clients that were successful
         TOTAL_CNT = 100   # total number of clients that test will create
@@ -608,6 +631,163 @@ class _TestTCP:
 
 
 class Test_UV_TCP(_TestTCP, tb.UVTestCase):
+
+    def test_create_server_buffered_1(self):
+        SIZE = 123123
+        eof = False
+        done = False
+
+        class Proto(asyncio.BaseProtocol):
+            def connection_made(self, tr):
+                self.tr = tr
+                self.recvd = b''
+                self.data = bytearray(50)
+                self.buf = memoryview(self.data)
+
+            def get_buffer(self, sizehint):
+                return self.buf
+
+            def buffer_updated(self, nbytes):
+                self.recvd += self.buf[:nbytes]
+                if self.recvd == b'a' * SIZE:
+                    self.tr.write(b'hello')
+
+            def eof_received(self):
+                nonlocal eof
+                eof = True
+
+            def connection_lost(self, exc):
+                nonlocal done
+                done = exc
+
+        async def test():
+            port = tb.find_free_port()
+            srv = await self.loop.create_server(Proto, '127.0.0.1', port)
+
+            s = socket.socket(socket.AF_INET)
+            with s:
+                s.setblocking(False)
+                await self.loop.sock_connect(s, ('127.0.0.1', port))
+                await self.loop.sock_sendall(s, b'a' * SIZE)
+                d = await self.loop.sock_recv(s, 100)
+                self.assertEqual(d, b'hello')
+
+            srv.close()
+            await srv.wait_closed()
+
+        self.loop.run_until_complete(test())
+        self.assertTrue(eof)
+        self.assertIsNone(done)
+
+    def test_create_server_buffered_2(self):
+        class ProtoExc(asyncio.BaseProtocol):
+            def __init__(self):
+                self._lost_exc = None
+
+            def get_buffer(self, sizehint):
+                1 / 0
+
+            def buffer_updated(self, nbytes):
+                pass
+
+            def connection_lost(self, exc):
+                self._lost_exc = exc
+
+            def eof_received(self):
+                pass
+
+        class ProtoZeroBuf1(asyncio.BaseProtocol):
+            def __init__(self):
+                self._lost_exc = None
+
+            def get_buffer(self, sizehint):
+                return bytearray(0)
+
+            def buffer_updated(self, nbytes):
+                pass
+
+            def connection_lost(self, exc):
+                self._lost_exc = exc
+
+            def eof_received(self):
+                pass
+
+        class ProtoZeroBuf2(asyncio.BaseProtocol):
+            def __init__(self):
+                self._lost_exc = None
+
+            def get_buffer(self, sizehint):
+                return memoryview(bytearray(0))
+
+            def buffer_updated(self, nbytes):
+                pass
+
+            def connection_lost(self, exc):
+                self._lost_exc = exc
+
+            def eof_received(self):
+                pass
+
+        class ProtoUpdatedError(asyncio.BaseProtocol):
+            def __init__(self):
+                self._lost_exc = None
+
+            def get_buffer(self, sizehint):
+                return memoryview(bytearray(100))
+
+            def buffer_updated(self, nbytes):
+                raise RuntimeError('oups')
+
+            def connection_lost(self, exc):
+                self._lost_exc = exc
+
+            def eof_received(self):
+                pass
+
+        async def test(proto_factory, exc_type, exc_re):
+            port = tb.find_free_port()
+            proto = proto_factory()
+            srv = await self.loop.create_server(
+                lambda: proto, '127.0.0.1', port)
+
+            try:
+                s = socket.socket(socket.AF_INET)
+                with s:
+                    s.setblocking(False)
+                    await self.loop.sock_connect(s, ('127.0.0.1', port))
+                    await self.loop.sock_sendall(s, b'a')
+                    d = await self.loop.sock_recv(s, 100)
+                    if not d:
+                        raise ConnectionResetError
+            except ConnectionResetError:
+                pass
+            else:
+                self.fail("server didn't abort the connection")
+                return
+            finally:
+                srv.close()
+                await srv.wait_closed()
+
+            if proto._lost_exc is None:
+                self.fail("connection_lost() was not called")
+                return
+
+            with self.assertRaisesRegex(exc_type, exc_re):
+                raise proto._lost_exc
+
+        self.loop.set_exception_handler(lambda loop, ctx: None)
+
+        self.loop.run_until_complete(
+            test(ProtoExc, RuntimeError, 'unhandled error .* get_buffer'))
+
+        self.loop.run_until_complete(
+            test(ProtoZeroBuf1, RuntimeError, 'unhandled error .* get_buffer'))
+
+        self.loop.run_until_complete(
+            test(ProtoZeroBuf2, RuntimeError, 'unhandled error .* get_buffer'))
+
+        self.loop.run_until_complete(
+            test(ProtoUpdatedError, RuntimeError, r'^oups$'))
 
     def test_transport_get_extra_info(self):
         # This tests is only for uvloop.  asyncio should pass it
@@ -855,6 +1035,17 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         srv.close()
         self.loop.run_until_complete(srv.wait_closed())
 
+    def test_connect_accepted_socket_ssl_args(self):
+        if self.implementation == 'asyncio' and not self.PY37:
+            raise unittest.SkipTest()
+
+        with self.assertRaisesRegex(
+                ValueError, 'ssl_handshake_timeout is only meaningful'):
+            with socket.socket() as s:
+                self.loop.run_until_complete(
+                    self.loop.connect_accepted_socket(
+                        (lambda: None), s, ssl_handshake_timeout=10.0))
+
     def test_connect_accepted_socket(self, server_ssl=None, client_ssl=None):
         loop = self.loop
 
@@ -898,9 +1089,15 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         conn, _ = lsock.accept()
         proto = MyProto(loop=loop)
         proto.loop = loop
+
+        extras = {}
+        if server_ssl and (self.implementation != 'asyncio' or self.PY37):
+            extras = dict(ssl_handshake_timeout=10.0)
+
         f = loop.create_task(
             loop.connect_accepted_socket(
-                (lambda: proto), conn, ssl=server_ssl))
+                (lambda: proto), conn, ssl=server_ssl,
+                **extras))
         loop.run_forever()
         conn.close()
         lsock.close()
@@ -913,7 +1110,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         tr, _ = f.result()
 
         if server_ssl:
-            self.assertIsInstance(tr, asyncio.sslproto._SSLProtocolTransport)
+            self.assertIn('SSL', tr.__class__.__name__)
 
         tr.close()
         # let it close
@@ -957,6 +1154,9 @@ class _TestSSL(tb.SSLTestCase):
 
     ONLYCERT = tb._cert_fullname(__file__, 'ssl_cert.pem')
     ONLYKEY = tb._cert_fullname(__file__, 'ssl_key.pem')
+
+    PAYLOAD_SIZE = 1024 * 100
+    TIMEOUT = 60
 
     def test_create_server_ssl_1(self):
         CNT = 0           # number of clients that were successful
@@ -1017,12 +1217,17 @@ class _TestSSL(tb.SSLTestCase):
             await fut
 
         async def start_server():
+            extras = {}
+            if self.implementation != 'asyncio' or self.PY37:
+                extras = dict(ssl_handshake_timeout=10.0)
+
             srv = await asyncio.start_server(
                 handle_client,
                 '127.0.0.1', 0,
                 family=socket.AF_INET,
                 ssl=sslctx,
-                loop=self.loop)
+                loop=self.loop,
+                **extras)
 
             try:
                 srv_socks = srv.sockets
@@ -1080,11 +1285,16 @@ class _TestSSL(tb.SSLTestCase):
             sock.close()
 
         async def client(addr):
+            extras = {}
+            if self.implementation != 'asyncio' or self.PY37:
+                extras = dict(ssl_handshake_timeout=10.0)
+
             reader, writer = await asyncio.open_connection(
                 *addr,
                 ssl=client_sslctx,
                 server_hostname='',
-                loop=self.loop)
+                loop=self.loop,
+                **extras)
 
             writer.write(A_DATA)
             self.assertEqual(await reader.readexactly(2), b'OK')
@@ -1140,6 +1350,142 @@ class _TestSSL(tb.SSLTestCase):
         with self._silence_eof_received_warning():
             run(client_sock)
 
+    def test_create_connection_ssl_slow_handshake(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        client_sslctx = self._create_client_ssl_context()
+
+        # silence error logger
+        self.loop.set_exception_handler(lambda *args: None)
+
+        def server(sock):
+            try:
+                sock.recv_all(1024 * 1024)
+            except ConnectionAbortedError:
+                pass
+            finally:
+                sock.close()
+
+        async def client(addr):
+            reader, writer = await asyncio.open_connection(
+                *addr,
+                ssl=client_sslctx,
+                server_hostname='',
+                loop=self.loop,
+                ssl_handshake_timeout=1.0)
+
+        with self.tcp_server(server,
+                             max_clients=1,
+                             backlog=1) as srv:
+
+            with self.assertRaisesRegex(
+                    ConnectionAbortedError,
+                    r'SSL handshake.*is taking longer'):
+
+                self.loop.run_until_complete(client(srv.addr))
+
+    def test_create_connection_ssl_failed_certificate(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        # silence error logger
+        self.loop.set_exception_handler(lambda *args: None)
+
+        sslctx = self._create_server_ssl_context(self.ONLYCERT, self.ONLYKEY)
+        client_sslctx = self._create_client_ssl_context(disable_verify=False)
+
+        def server(sock):
+            try:
+                sock.starttls(
+                    sslctx,
+                    server_side=True)
+                sock.connect()
+            except ssl.SSLError:
+                pass
+            finally:
+                sock.close()
+
+        async def client(addr):
+            reader, writer = await asyncio.open_connection(
+                *addr,
+                ssl=client_sslctx,
+                server_hostname='',
+                loop=self.loop,
+                ssl_handshake_timeout=1.0)
+
+        with self.tcp_server(server,
+                             max_clients=1,
+                             backlog=1) as srv:
+
+            exc_type = ssl.SSLError
+            if self.PY37:
+                exc_type = ssl.SSLCertVerificationError
+            with self.assertRaises(exc_type):
+                self.loop.run_until_complete(client(srv.addr))
+
+    def test_start_tls_wrong_args(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        async def main():
+            with self.assertRaisesRegex(TypeError, 'SSLContext, got'):
+                await self.loop.start_tls(None, None, None)
+
+            sslctx = self._create_server_ssl_context(
+                self.ONLYCERT, self.ONLYKEY)
+            with self.assertRaisesRegex(TypeError, 'is not supported'):
+                await self.loop.start_tls(None, None, sslctx)
+
+        self.loop.run_until_complete(main())
+
+    def test_ssl_handshake_timeout(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        # bpo-29970: Check that a connection is aborted if handshake is not
+        # completed in timeout period, instead of remaining open indefinitely
+        client_sslctx = self._create_client_ssl_context()
+
+        # silence error logger
+        messages = []
+        self.loop.set_exception_handler(lambda loop, ctx: messages.append(ctx))
+
+        server_side_aborted = False
+
+        def server(sock):
+            nonlocal server_side_aborted
+            try:
+                sock.recv_all(1024 * 1024)
+            except ConnectionAbortedError:
+                server_side_aborted = True
+            finally:
+                sock.close()
+
+        async def client(addr):
+            await asyncio.wait_for(
+                self.loop.create_connection(
+                    asyncio.Protocol,
+                    *addr,
+                    ssl=client_sslctx,
+                    server_hostname='',
+                    ssl_handshake_timeout=10.0),
+                0.5,
+                loop=self.loop)
+
+        with self.tcp_server(server,
+                             max_clients=1,
+                             backlog=1) as srv:
+
+            with self.assertRaises(asyncio.TimeoutError):
+                self.loop.run_until_complete(client(srv.addr))
+
+        self.assertTrue(server_side_aborted)
+
+        # Python issue #23197: cancelling a handshake must not raise an
+        # exception or log an error, even if the handshake failed
+        self.assertEqual(messages, [])
+
     def test_ssl_connect_accepted_socket(self):
         server_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
         server_context.load_cert_chain(self.ONLYCERT, self.ONLYKEY)
@@ -1154,6 +1500,361 @@ class _TestSSL(tb.SSLTestCase):
 
         Test_UV_TCP.test_connect_accepted_socket(
             self, server_context, client_context)
+
+    def test_start_tls_client_corrupted_ssl(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        self.loop.set_exception_handler(lambda loop, ctx: None)
+
+        sslctx = self._create_server_ssl_context(self.ONLYCERT, self.ONLYKEY)
+        client_sslctx = self._create_client_ssl_context()
+
+        def server(sock):
+            orig_sock = sock.dup()
+            try:
+                sock.starttls(
+                    sslctx,
+                    server_side=True)
+                sock.sendall(b'A\n')
+                sock.recv_all(1)
+                orig_sock.send(b'please corrupt the SSL connection')
+            except ssl.SSLError:
+                pass
+            finally:
+                sock.close()
+                orig_sock.close()
+
+        async def client(addr):
+            reader, writer = await asyncio.open_connection(
+                *addr,
+                ssl=client_sslctx,
+                server_hostname='',
+                loop=self.loop)
+
+            self.assertEqual(await reader.readline(), b'A\n')
+            writer.write(b'B')
+            with self.assertRaises(ssl.SSLError):
+                await reader.readline()
+            writer.close()
+            return 'OK'
+
+        with self.tcp_server(server,
+                             max_clients=1,
+                             backlog=1) as srv:
+
+            res = self.loop.run_until_complete(client(srv.addr))
+
+        self.assertEqual(res, 'OK')
+
+    def test_start_tls_client_reg_proto_1(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        HELLO_MSG = b'1' * self.PAYLOAD_SIZE
+
+        server_context = self._create_server_ssl_context(
+            self.ONLYCERT, self.ONLYKEY)
+        client_context = self._create_client_ssl_context()
+
+        def serve(sock):
+            sock.settimeout(self.TIMEOUT)
+
+            data = sock.recv_all(len(HELLO_MSG))
+            self.assertEqual(len(data), len(HELLO_MSG))
+
+            sock.starttls(server_context, server_side=True)
+
+            sock.sendall(b'O')
+            data = sock.recv_all(len(HELLO_MSG))
+            self.assertEqual(len(data), len(HELLO_MSG))
+
+            sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+
+        class ClientProto(asyncio.Protocol):
+            def __init__(self, on_data, on_eof):
+                self.on_data = on_data
+                self.on_eof = on_eof
+                self.con_made_cnt = 0
+
+            def connection_made(proto, tr):
+                proto.con_made_cnt += 1
+                # Ensure connection_made gets called only once.
+                self.assertEqual(proto.con_made_cnt, 1)
+
+            def data_received(self, data):
+                self.on_data.set_result(data)
+
+            def eof_received(self):
+                self.on_eof.set_result(True)
+
+        async def client(addr):
+            await asyncio.sleep(0.5, loop=self.loop)
+
+            on_data = self.loop.create_future()
+            on_eof = self.loop.create_future()
+
+            tr, proto = await self.loop.create_connection(
+                lambda: ClientProto(on_data, on_eof), *addr)
+
+            tr.write(HELLO_MSG)
+            new_tr = await self.loop.start_tls(tr, proto, client_context)
+
+            self.assertEqual(await on_data, b'O')
+            new_tr.write(HELLO_MSG)
+            await on_eof
+
+            new_tr.close()
+
+        with self.tcp_server(serve, timeout=self.TIMEOUT) as srv:
+            self.loop.run_until_complete(
+                asyncio.wait_for(client(srv.addr), loop=self.loop, timeout=10))
+
+    def test_start_tls_client_buf_proto_1(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        HELLO_MSG = b'1' * self.PAYLOAD_SIZE
+
+        server_context = self._create_server_ssl_context(
+            self.ONLYCERT, self.ONLYKEY)
+        client_context = self._create_client_ssl_context()
+
+        client_con_made_calls = 0
+
+        def serve(sock):
+            sock.settimeout(self.TIMEOUT)
+
+            data = sock.recv_all(len(HELLO_MSG))
+            self.assertEqual(len(data), len(HELLO_MSG))
+
+            sock.starttls(server_context, server_side=True)
+
+            sock.sendall(b'O')
+            data = sock.recv_all(len(HELLO_MSG))
+            self.assertEqual(len(data), len(HELLO_MSG))
+
+            sock.sendall(b'2')
+            data = sock.recv_all(len(HELLO_MSG))
+            self.assertEqual(len(data), len(HELLO_MSG))
+
+            sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+
+        class ClientProtoFirst(asyncio.BaseProtocol):
+            def __init__(self, on_data):
+                self.on_data = on_data
+                self.buf = bytearray(1)
+
+            def connection_made(self, tr):
+                nonlocal client_con_made_calls
+                client_con_made_calls += 1
+
+            def get_buffer(self, sizehint):
+                return self.buf
+
+            def buffer_updated(self, nsize):
+                assert nsize == 1
+                self.on_data.set_result(bytes(self.buf[:nsize]))
+
+            def eof_received(self):
+                pass
+
+        class ClientProtoSecond(asyncio.Protocol):
+            def __init__(self, on_data, on_eof):
+                self.on_data = on_data
+                self.on_eof = on_eof
+                self.con_made_cnt = 0
+
+            def connection_made(self, tr):
+                nonlocal client_con_made_calls
+                client_con_made_calls += 1
+
+            def data_received(self, data):
+                self.on_data.set_result(data)
+
+            def eof_received(self):
+                self.on_eof.set_result(True)
+
+        async def client(addr):
+            await asyncio.sleep(0.5, loop=self.loop)
+
+            on_data1 = self.loop.create_future()
+            on_data2 = self.loop.create_future()
+            on_eof = self.loop.create_future()
+
+            tr, proto = await self.loop.create_connection(
+                lambda: ClientProtoFirst(on_data1), *addr)
+
+            tr.write(HELLO_MSG)
+            new_tr = await self.loop.start_tls(tr, proto, client_context)
+
+            self.assertEqual(await on_data1, b'O')
+            new_tr.write(HELLO_MSG)
+
+            new_tr.set_protocol(ClientProtoSecond(on_data2, on_eof))
+            self.assertEqual(await on_data2, b'2')
+            new_tr.write(HELLO_MSG)
+            await on_eof
+
+            new_tr.close()
+
+            # connection_made() should be called only once -- when
+            # we establish connection for the first time. Start TLS
+            # doesn't call connection_made() on application protocols.
+            self.assertEqual(client_con_made_calls, 1)
+
+        with self.tcp_server(serve, timeout=self.TIMEOUT) as srv:
+            self.loop.run_until_complete(
+                asyncio.wait_for(client(srv.addr),
+                                 loop=self.loop, timeout=self.TIMEOUT))
+
+    def test_start_tls_slow_client_cancel(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        HELLO_MSG = b'1' * self.PAYLOAD_SIZE
+
+        client_context = self._create_client_ssl_context()
+        server_waits_on_handshake = self.loop.create_future()
+
+        def serve(sock):
+            sock.settimeout(self.TIMEOUT)
+
+            data = sock.recv_all(len(HELLO_MSG))
+            self.assertEqual(len(data), len(HELLO_MSG))
+
+            try:
+                self.loop.call_soon_threadsafe(
+                    server_waits_on_handshake.set_result, None)
+                data = sock.recv_all(1024 * 1024)
+            except ConnectionAbortedError:
+                pass
+            finally:
+                sock.close()
+
+        class ClientProto(asyncio.Protocol):
+            def __init__(self, on_data, on_eof):
+                self.on_data = on_data
+                self.on_eof = on_eof
+                self.con_made_cnt = 0
+
+            def connection_made(proto, tr):
+                proto.con_made_cnt += 1
+                # Ensure connection_made gets called only once.
+                self.assertEqual(proto.con_made_cnt, 1)
+
+            def data_received(self, data):
+                self.on_data.set_result(data)
+
+            def eof_received(self):
+                self.on_eof.set_result(True)
+
+        async def client(addr):
+            await asyncio.sleep(0.5, loop=self.loop)
+
+            on_data = self.loop.create_future()
+            on_eof = self.loop.create_future()
+
+            tr, proto = await self.loop.create_connection(
+                lambda: ClientProto(on_data, on_eof), *addr)
+
+            tr.write(HELLO_MSG)
+
+            await server_waits_on_handshake
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self.loop.start_tls(tr, proto, client_context),
+                    0.5,
+                    loop=self.loop)
+
+        with self.tcp_server(serve, timeout=self.TIMEOUT) as srv:
+            self.loop.run_until_complete(
+                asyncio.wait_for(client(srv.addr), loop=self.loop, timeout=10))
+
+    def test_start_tls_server_1(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        HELLO_MSG = b'1' * self.PAYLOAD_SIZE
+
+        server_context = self._create_server_ssl_context(
+            self.ONLYCERT, self.ONLYKEY)
+        client_context = self._create_client_ssl_context()
+
+        def client(sock, addr):
+            sock.settimeout(self.TIMEOUT)
+
+            sock.connect(addr)
+            data = sock.recv_all(len(HELLO_MSG))
+            self.assertEqual(len(data), len(HELLO_MSG))
+
+            sock.starttls(client_context)
+            sock.sendall(HELLO_MSG)
+
+            sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+
+        class ServerProto(asyncio.Protocol):
+            def __init__(self, on_con, on_eof, on_con_lost):
+                self.on_con = on_con
+                self.on_eof = on_eof
+                self.on_con_lost = on_con_lost
+                self.data = b''
+
+            def connection_made(self, tr):
+                self.on_con.set_result(tr)
+
+            def data_received(self, data):
+                self.data += data
+
+            def eof_received(self):
+                self.on_eof.set_result(1)
+
+            def connection_lost(self, exc):
+                if exc is None:
+                    self.on_con_lost.set_result(None)
+                else:
+                    self.on_con_lost.set_exception(exc)
+
+        async def main(proto, on_con, on_eof, on_con_lost):
+            tr = await on_con
+            tr.write(HELLO_MSG)
+
+            self.assertEqual(proto.data, b'')
+
+            new_tr = await self.loop.start_tls(
+                tr, proto, server_context,
+                server_side=True,
+                ssl_handshake_timeout=self.TIMEOUT)
+
+            await on_eof
+            await on_con_lost
+            self.assertEqual(proto.data, HELLO_MSG)
+            new_tr.close()
+
+        async def run_main():
+            on_con = self.loop.create_future()
+            on_eof = self.loop.create_future()
+            on_con_lost = self.loop.create_future()
+            proto = ServerProto(on_con, on_eof, on_con_lost)
+
+            server = await self.loop.create_server(
+                lambda: proto, '127.0.0.1', 0)
+            addr = server.sockets[0].getsockname()
+
+            with self.tcp_client(lambda sock: client(sock, addr),
+                                 timeout=self.TIMEOUT):
+                await asyncio.wait_for(
+                    main(proto, on_con, on_eof, on_con_lost),
+                    loop=self.loop, timeout=self.TIMEOUT)
+
+            server.close()
+            await server.wait_closed()
+
+        self.loop.run_until_complete(run_main())
 
 
 class Test_UV_TCPSSL(_TestSSL, tb.UVTestCase):

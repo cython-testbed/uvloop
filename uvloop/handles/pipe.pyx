@@ -39,11 +39,12 @@ cdef class UnixServer(UVStreamServer):
 
     @staticmethod
     cdef UnixServer new(Loop loop, object protocol_factory, Server server,
-                          object ssl):
+                        object ssl, object ssl_handshake_timeout):
 
         cdef UnixServer handle
         handle = UnixServer.__new__(UnixServer)
-        handle._init(loop, protocol_factory, server, ssl)
+        handle._init(loop, protocol_factory, server,
+                     ssl, ssl_handshake_timeout)
         __pipe_init_uv_handle(<UVStream>handle, loop)
         return handle
 
@@ -206,7 +207,7 @@ cdef void __pipe_connect_callback(uv.uv_connect_t* req, int status) with gil:
     try:
         transport._on_connect(exc)
     except BaseException as ex:
-        wrapper.transport._error(ex, False)
+        wrapper.transport._fatal_error(ex, False)
     finally:
         wrapper.on_done()
 

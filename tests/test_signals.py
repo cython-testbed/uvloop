@@ -3,6 +3,7 @@ import signal
 import subprocess
 import sys
 import time
+import uvloop
 
 from uvloop import _testbase as tb
 
@@ -39,7 +40,7 @@ run()
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 loop=self.loop)
@@ -85,7 +86,7 @@ run()
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 loop=self.loop)
@@ -126,7 +127,7 @@ finally:
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 loop=self.loop)
@@ -176,7 +177,7 @@ finally:
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 loop=self.loop)
@@ -235,7 +236,7 @@ finally:
 """
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-c', PROG,
+                sys.executable, b'-W', b'ignore', b'-c', PROG,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 loop=self.loop)
@@ -276,6 +277,38 @@ finally:
 
 class Test_UV_Signals(_TestSignal, tb.UVTestCase):
     NEW_LOOP = 'uvloop.new_event_loop()'
+
+    def test_signals_no_SIGCHLD(self):
+        with self.assertRaisesRegex(RuntimeError,
+                                    r"cannot add.*handler.*SIGCHLD"):
+
+            self.loop.add_signal_handler(signal.SIGCHLD, lambda *a: None)
+
+    def test_asyncio_add_watcher_SIGCHLD_nop(self):
+        async def proc(loop):
+            proc = await asyncio.create_subprocess_exec(
+                'echo',
+                stdout=subprocess.DEVNULL,
+                loop=loop)
+            await proc.wait()
+
+        aio_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(aio_loop)
+        try:
+            aio_loop.run_until_complete(proc(aio_loop))
+        finally:
+            aio_loop.close()
+            asyncio.set_event_loop(None)
+
+        try:
+            loop = uvloop.new_event_loop()
+            with self.assertWarnsRegex(
+                    RuntimeWarning,
+                    "asyncio is trying to install its ChildWatcher"):
+                asyncio.set_event_loop(loop)
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
 
 
 class Test_AIO_Signals(_TestSignal, tb.AIOTestCase):

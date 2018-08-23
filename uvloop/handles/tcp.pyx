@@ -58,11 +58,13 @@ cdef class TCPServer(UVStreamServer):
 
     @staticmethod
     cdef TCPServer new(Loop loop, object protocol_factory, Server server,
-                       object ssl, unsigned int flags):
+                       object ssl, unsigned int flags,
+                       object ssl_handshake_timeout):
 
         cdef TCPServer handle
         handle = TCPServer.__new__(TCPServer)
-        handle._init(loop, protocol_factory, server, ssl)
+        handle._init(loop, protocol_factory, server,
+                     ssl, ssl_handshake_timeout)
         __tcp_init_uv_handle(<UVStream>handle, loop, flags)
         return handle
 
@@ -214,7 +216,7 @@ cdef void __tcp_connect_callback(uv.uv_connect_t* req, int status) with gil:
     try:
         transport._on_connect(exc)
     except BaseException as ex:
-        wrapper.transport._error(ex, False)
+        wrapper.transport._fatal_error(ex, False)
     finally:
         wrapper.on_done()
 

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import gc
 import os
 import pathlib
 import signal
@@ -9,11 +10,15 @@ import tempfile
 import time
 import unittest
 
-from asyncio import test_utils
+import psutil
+
 from uvloop import _testbase as tb
 
 
 class _TestProcess:
+    def get_num_fds(self):
+        return psutil.Process(os.getpid()).num_fds()
+
     def test_process_env_1(self):
         async def test():
             cmd = 'echo $FOO$BAR'
@@ -79,7 +84,7 @@ class _TestProcess:
         async def test():
             cmd = sys.executable
             proc = await asyncio.create_subprocess_exec(
-                cmd, '-c',
+                cmd, b'-W', b'ignore', '-c',
                 'import os,sys;sys.stdout.write(os.getenv("FRUIT"))',
                 stdout=subprocess.PIPE,
                 preexec_fn=lambda: os.putenv("FRUIT", "apple"),
@@ -100,7 +105,7 @@ class _TestProcess:
         async def test():
             cmd = sys.executable
             proc = await asyncio.create_subprocess_exec(
-                cmd, '-c', 'import time; time.sleep(10)',
+                cmd, b'-W', b'ignore', '-c', 'import time; time.sleep(10)',
                 preexec_fn=raise_it,
                 loop=self.loop)
 
@@ -126,7 +131,7 @@ class _TestProcess:
     def test_process_executable_1(self):
         async def test():
             proc = await asyncio.create_subprocess_exec(
-                b'doesnotexist', b'-c', b'print("spam")',
+                b'doesnotexist', b'-W', b'ignore', b'-c', b'print("spam")',
                 executable=sys.executable,
                 stdout=subprocess.PIPE,
                 loop=self.loop)
@@ -145,7 +150,7 @@ print(os.getpid())
 
             cmd = sys.executable
             proc = await asyncio.create_subprocess_exec(
-                cmd, b'-c', prog,
+                cmd, b'-W', b'ignore', b'-c', prog,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 loop=self.loop)
@@ -177,7 +182,7 @@ exit(11)
 
             cmd = sys.executable
             proc = await asyncio.create_subprocess_exec(
-                cmd, b'-c', prog,
+                cmd, b'-W', b'ignore', b'-c', prog,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -216,7 +221,7 @@ while True:
 
             cmd = sys.executable
             proc = await asyncio.create_subprocess_exec(
-                cmd, b'-c', prog,
+                cmd, b'-W', b'ignore', b'-c', prog,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -260,7 +265,7 @@ print('err', file=sys.stderr, flush=True)
             '''
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, '-c', prog,
+                sys.executable, b'-W', b'ignore', b'-c', prog,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 loop=self.loop)
@@ -280,7 +285,7 @@ print('err', file=sys.stderr, flush=True)
             '''
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, '-c', prog,
+                sys.executable, b'-W', b'ignore', b'-c', prog,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -316,7 +321,7 @@ print("OK")
                     tempfile.TemporaryFile() as non_inherited:
 
                 proc = await asyncio.create_subprocess_exec(
-                    sys.executable, '-c', prog, '--',
+                    sys.executable, b'-W', b'ignore', b'-c', prog, '--',
                     str(inherited.fileno()),
                     str(non_inherited.fileno()),
                     stdout=subprocess.PIPE,
@@ -330,18 +335,63 @@ print("OK")
 
         self.loop.run_until_complete(test())
 
+    def test_subprocess_fd_leak_1(self):
+        async def main(n):
+            for i in range(n):
+                try:
+                    await asyncio.create_subprocess_exec(
+                        'nonexistant',
+                        loop=self.loop,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                except FileNotFoundError:
+                    pass
+                await asyncio.sleep(0, loop=self.loop)
+
+        self.loop.run_until_complete(main(10))
+        num_fd_1 = self.get_num_fds()
+        self.loop.run_until_complete(main(10))
+        num_fd_2 = self.get_num_fds()
+
+        self.assertEqual(num_fd_1, num_fd_2)
+
+    def test_subprocess_fd_leak_2(self):
+        async def main(n):
+            for i in range(n):
+                try:
+                    p = await asyncio.create_subprocess_exec(
+                        'ls',
+                        loop=self.loop,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                finally:
+                    await p.wait()
+                await asyncio.sleep(0, loop=self.loop)
+
+        self.loop.run_until_complete(main(10))
+        num_fd_1 = self.get_num_fds()
+        self.loop.run_until_complete(main(10))
+        num_fd_2 = self.get_num_fds()
+
+        self.assertEqual(num_fd_1, num_fd_2)
+
 
 class _AsyncioTests:
 
     # Program blocking
-    PROGRAM_BLOCKED = [sys.executable, '-c', 'import time; time.sleep(3600)']
+    PROGRAM_BLOCKED = [sys.executable, b'-W', b'ignore',
+                       b'-c', b'import time; time.sleep(3600)']
 
     # Program copying input to output
     PROGRAM_CAT = [
-        sys.executable, '-c',
-        ';'.join(('import sys',
-                  'data = sys.stdin.buffer.read()',
-                  'sys.stdout.buffer.write(data)'))]
+        sys.executable, b'-c',
+        b';'.join((b'import sys',
+                   b'data = sys.stdin.buffer.read()',
+                   b'sys.stdout.buffer.write(data)'))]
+
+    PROGRAM_ERROR = [
+        sys.executable, b'-W', b'ignore', b'-c', b'1/0'
+    ]
 
     def test_stdin_not_inheritable(self):
         # asyncio issue #209: stdin must not be inheritable, otherwise
@@ -350,7 +400,7 @@ class _AsyncioTests:
         def len_message(message):
             code = 'import sys; data = sys.stdin.read(); print(len(data))'
             proc = yield from asyncio.create_subprocess_exec(
-                sys.executable, '-c', code,
+                sys.executable, b'-W', b'ignore', b'-c', code,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -364,7 +414,7 @@ class _AsyncioTests:
         self.assertEqual(output.rstrip(), b'3')
         self.assertEqual(exitcode, 0)
 
-    def test_stdin_stdout(self):
+    def test_stdin_stdout_pipe(self):
         args = self.PROGRAM_CAT
 
         @asyncio.coroutine
@@ -390,6 +440,57 @@ class _AsyncioTests:
         exitcode, stdout = self.loop.run_until_complete(task)
         self.assertEqual(exitcode, 0)
         self.assertEqual(stdout, b'some data')
+
+    def test_stdin_stdout_file(self):
+        args = self.PROGRAM_CAT
+
+        @asyncio.coroutine
+        def run(data, stdout):
+            proc = yield from asyncio.create_subprocess_exec(
+                *args,
+                stdin=subprocess.PIPE,
+                stdout=stdout,
+                loop=self.loop)
+
+            # feed data
+            proc.stdin.write(data)
+            yield from proc.stdin.drain()
+            proc.stdin.close()
+
+            exitcode = yield from proc.wait()
+            return exitcode
+
+        with tempfile.TemporaryFile('w+b') as new_stdout:
+            task = run(b'some data', new_stdout)
+            task = asyncio.wait_for(task, 60.0, loop=self.loop)
+            exitcode = self.loop.run_until_complete(task)
+            self.assertEqual(exitcode, 0)
+
+            new_stdout.seek(0)
+            self.assertEqual(new_stdout.read(), b'some data')
+
+    def test_stdin_stderr_file(self):
+        args = self.PROGRAM_ERROR
+
+        @asyncio.coroutine
+        def run(stderr):
+            proc = yield from asyncio.create_subprocess_exec(
+                *args,
+                stdin=subprocess.PIPE,
+                stderr=stderr,
+                loop=self.loop)
+
+            exitcode = yield from proc.wait()
+            return exitcode
+
+        with tempfile.TemporaryFile('w+b') as new_stderr:
+            task = run(new_stderr)
+            task = asyncio.wait_for(task, 60.0, loop=self.loop)
+            exitcode = self.loop.run_until_complete(task)
+            self.assertEqual(exitcode, 1)
+
+            new_stderr.seek(0)
+            self.assertIn(b'ZeroDivisionError', new_stderr.read())
 
     def test_communicate(self):
         args = self.PROGRAM_CAT
@@ -444,7 +545,7 @@ class _AsyncioTests:
 
     def test_send_signal(self):
         code = 'import time; print("sleeping", flush=True); time.sleep(3600)'
-        args = [sys.executable, '-c', code]
+        args = [sys.executable, b'-W', b'ignore', b'-c', code]
         create = asyncio.create_subprocess_exec(*args,
                                                 stdout=subprocess.PIPE,
                                                 loop=self.loop)
@@ -502,9 +603,13 @@ class _AsyncioTests:
             except asyncio.CancelledError:
                 pass
 
+            # Give the process handler some time to close itself
+            yield from asyncio.sleep(0.3, loop=self.loop)
+            gc.collect()
+
         # ignore the log:
         # "Exception during subprocess creation, kill the subprocess"
-        with test_utils.disable_logger():
+        with tb.disable_logger():
             self.loop.run_until_complete(cancel_make_transport())
 
     def test_cancel_post_init(self):
@@ -520,11 +625,41 @@ class _AsyncioTests:
             except asyncio.CancelledError:
                 pass
 
+            # Give the process handler some time to close itself
+            yield from asyncio.sleep(0.3, loop=self.loop)
+            gc.collect()
+
         # ignore the log:
         # "Exception during subprocess creation, kill the subprocess"
-        with test_utils.disable_logger():
+        with tb.disable_logger():
             self.loop.run_until_complete(cancel_make_transport())
-            test_utils.run_briefly(self.loop)
+            tb.run_briefly(self.loop)
+
+    def test_close_gets_process_closed(self):
+
+        loop = self.loop
+
+        class Protocol(asyncio.SubprocessProtocol):
+
+            def __init__(self):
+                self.closed = loop.create_future()
+
+            def connection_lost(self, exc):
+                self.closed.set_result(1)
+
+        @asyncio.coroutine
+        def test_subprocess():
+            transport, protocol = yield from loop.subprocess_exec(
+                Protocol, *self.PROGRAM_BLOCKED)
+            pid = transport.get_pid()
+            transport.close()
+            self.assertIsNone(transport.get_returncode())
+            yield from protocol.closed
+            self.assertIsNotNone(transport.get_returncode())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+        loop.run_until_complete(test_subprocess())
 
 
 class Test_UV_Process(_TestProcess, tb.UVTestCase):
@@ -540,7 +675,7 @@ print('err', file=sys.stderr, flush=True)
             '''
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, '-c', prog,
+                sys.executable, b'-W', b'ignore', b'-c', prog,
                 loop=self.loop)
 
             out, err = await proc.communicate()

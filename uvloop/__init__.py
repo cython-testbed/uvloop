@@ -1,4 +1,4 @@
-import asyncio
+import asyncio as __asyncio
 
 from asyncio.events import BaseDefaultEventLoopPolicy as __BasePolicy
 
@@ -7,16 +7,22 @@ from . import _patch  # NOQA
 from .loop import Loop as __BaseLoop  # NOQA
 
 
-__all__ = ('new_event_loop', 'EventLoopPolicy')
+__version__ = '0.12.0.dev0'
+__all__ = ('new_event_loop', 'install', 'EventLoopPolicy')
 
 
-class Loop(__BaseLoop, asyncio.AbstractEventLoop):
+class Loop(__BaseLoop, __asyncio.AbstractEventLoop):
     pass
 
 
 def new_event_loop():
     """Return a new event loop."""
     return Loop()
+
+
+def install():
+    """A helper function to install uvloop policy."""
+    __asyncio.set_event_loop_policy(EventLoopPolicy())
 
 
 class EventLoopPolicy(__BasePolicy):

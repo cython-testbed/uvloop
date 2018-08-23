@@ -13,6 +13,7 @@ import re
 import select
 import socket
 import ssl
+import sys
 import tempfile
 import threading
 import time
@@ -88,6 +89,9 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
             # Disable `_get_running_loop`.
             self._get_running_loop = asyncio.events._get_running_loop
             asyncio.events._get_running_loop = lambda: None
+
+        self.PY37 = sys.version_info[:2] >= (3, 7)
+        self.PY36 = sys.version_info[:2] >= (3, 6)
 
     def tearDown(self):
         self.loop.close()
@@ -268,10 +272,11 @@ class SSLTestCase:
         sslcontext.load_cert_chain(certfile, keyfile)
         return sslcontext
 
-    def _create_client_ssl_context(self):
+    def _create_client_ssl_context(self, *, disable_verify=True):
         sslcontext = ssl.create_default_context()
         sslcontext.check_hostname = False
-        sslcontext.verify_mode = ssl.CERT_NONE
+        if disable_verify:
+            sslcontext.verify_mode = ssl.CERT_NONE
         return sslcontext
 
     @contextlib.contextmanager
@@ -483,3 +488,46 @@ class TestThreadedServer(SocketThread):
     @property
     def addr(self):
         return self._sock.getsockname()
+
+
+###############################################################################
+# A few helpers from asyncio/tests/testutils.py
+###############################################################################
+
+
+def run_briefly(loop):
+    async def once():
+        pass
+    gen = once()
+    t = loop.create_task(gen)
+    # Don't log a warning if the task is not done after run_until_complete().
+    # It occurs if the loop is stopped or if a task raises a BaseException.
+    t._log_destroy_pending = False
+    try:
+        loop.run_until_complete(t)
+    finally:
+        gen.close()
+
+
+def run_until(loop, pred, timeout=30):
+    deadline = time.time() + timeout
+    while not pred():
+        if timeout is not None:
+            timeout = deadline - time.time()
+            if timeout <= 0:
+                raise asyncio.futures.TimeoutError()
+        loop.run_until_complete(asyncio.tasks.sleep(0.001, loop=loop))
+
+
+@contextlib.contextmanager
+def disable_logger():
+    """Context manager to disable asyncio logger.
+
+    For example, it can be used to ignore warnings in debug mode.
+    """
+    old_level = asyncio.log.logger.level
+    try:
+        asyncio.log.logger.setLevel(logging.CRITICAL + 1)
+        yield
+    finally:
+        asyncio.log.logger.setLevel(old_level)

@@ -1,4 +1,5 @@
-cython==0.27.3
+cython==0.28.4
 aiohttp
 tinys3
 twine
+psutil
