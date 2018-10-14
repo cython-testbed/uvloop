@@ -15,10 +15,9 @@ from .includes.python cimport PY_VERSION_HEX, \
                               _PyImport_AcquireLock, \
                               _PyImport_ReleaseLock, \
                               _Py_RestoreSignals, \
-                              PyContext, \
-                              PyContext_CopyCurrent, \
-                              PyContext_Enter, \
-                              PyContext_Exit, \
+                              Context_CopyCurrent, \
+                              Context_Enter, \
+                              Context_Exit, \
                               PyMemoryView_FromMemory, PyBUF_WRITE, \
                               PyMemoryView_FromObject, PyMemoryView_Check
 from .includes.flowcontrol cimport add_flowcontrol_defaults
@@ -1560,16 +1559,17 @@ cdef class Loop:
         transport.set_protocol(ssl_protocol)
         conmade_cb = self.call_soon(ssl_protocol.connection_made, transport)
         resume_cb = self.call_soon(transport.resume_reading)
+        app_transport = ssl_protocol._get_app_transport()
 
         try:
             await waiter
         except Exception:
-            transport.close()
+            app_transport.close()
             conmade_cb.cancel()
             resume_cb.cancel()
             raise
 
-        return (<SSLProtocol>ssl_protocol)._app_transport
+        return app_transport
 
     @cython.iterable_coroutine
     async def create_server(self, protocol_factory, host=None, port=None,
@@ -1757,6 +1757,7 @@ cdef class Loop:
             system.sockaddr_storage lai_addr_static
 
             object app_protocol
+            object app_transport
             object protocol
             object ssl_waiter
 
@@ -1937,12 +1938,13 @@ cdef class Loop:
             tr._attach_fileobj(sock)
 
         if ssl:
+            app_transport = protocol._get_app_transport()
             try:
                 await ssl_waiter
             except Exception:
-                tr._close()
+                app_transport.close()
                 raise
-            return (<SSLProtocol>protocol)._app_transport, app_protocol
+            return app_transport, app_protocol
         else:
             return tr, protocol
 
@@ -2088,6 +2090,7 @@ cdef class Loop:
         cdef:
             UnixTransport tr
             object app_protocol
+            object app_transport
             object protocol
             object ssl_waiter
 
@@ -2167,12 +2170,13 @@ cdef class Loop:
             tr._attach_fileobj(sock)
 
         if ssl:
+            app_transport = protocol._get_app_transport()
             try:
                 await ssl_waiter
             except Exception:
-                tr._close()
+                app_transport.close()
                 raise
-            return (<SSLProtocol>protocol)._app_transport, app_protocol
+            return app_transport, app_protocol
         else:
             return tr, protocol
 
@@ -2529,15 +2533,20 @@ cdef class Loop:
         transport._init_protocol()
         transport._attach_fileobj(sock)
 
-        try:
-            await waiter
-        except Exception:
-            transport._close()
-            raise
-
         if ssl:
-            return (<SSLProtocol>protocol)._app_transport, protocol
+            app_transport = protocol._get_app_transport()
+            try:
+                await waiter
+            except Exception:
+                app_transport.close()
+                raise
+            return app_transport, protocol
         else:
+            try:
+                await waiter
+            except Exception:
+                transport._close()
+                raise
             return transport, protocol
 
     def run_in_executor(self, executor, func, *args):

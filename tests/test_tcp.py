@@ -1445,7 +1445,7 @@ class _TestSSL(tb.SSLTestCase):
                     sslctx,
                     server_side=True)
                 sock.connect()
-            except ssl.SSLError:
+            except (ssl.SSLError, OSError):
                 pass
             finally:
                 sock.close()
@@ -2356,9 +2356,15 @@ class _TestSSL(tb.SSLTestCase):
                 try:
                     sock.unwrap()
                     break
+                except ssl.SSLError as ex:
+                    # Since OpenSSL 1.1.1, it raises "application data after
+                    # close notify"
+                    if ex.reason == 'KRB5_S_INIT':
+                        break
                 except OSError as ex:
-                    if ex.errno == 0:
-                        pass
+                    # OpenSSL < 1.1.1
+                    if ex.errno != 0:
+                        raise
             sock.close()
 
         async def client(addr):
@@ -2523,8 +2529,15 @@ class _TestSSL(tb.SSLTestCase):
                         sock.send(outgoing.read())
                     break
 
-            incoming.write(sock.recv(16384))
-            self.assertEqual(sslobj.read(4), b'ping')
+            while True:
+                try:
+                    data = sslobj.read(4)
+                except ssl.SSLWantReadError:
+                    incoming.write(sock.recv(16384))
+                else:
+                    break
+
+            self.assertEqual(data, b'ping')
             sslobj.write(b'pong')
             sock.send(outgoing.read())
 
@@ -2609,6 +2622,34 @@ class _TestSSL(tb.SSLTestCase):
 
         with self.tcp_server(run(eof_server)) as srv:
             self.loop.run_until_complete(client(srv.addr))
+
+    def test_connect_timeout_warning(self):
+        s = socket.socket(socket.AF_INET)
+        s.bind(('127.0.0.1', 0))
+        addr = s.getsockname()
+
+        async def test():
+            try:
+                await asyncio.wait_for(
+                    self.loop.create_connection(asyncio.Protocol,
+                                                *addr, ssl=True),
+                    0.1, loop=self.loop)
+            except (ConnectionRefusedError, asyncio.TimeoutError):
+                pass
+            else:
+                self.fail('TimeoutError is not raised')
+
+        with s:
+            try:
+                with self.assertWarns(ResourceWarning) as cm:
+                    self.loop.run_until_complete(test())
+                    gc.collect()
+                    gc.collect()
+                    gc.collect()
+            except AssertionError as e:
+                self.assertEqual(str(e), 'ResourceWarning not triggered')
+            else:
+                self.fail('Unexpected ResourceWarning: {}'.format(cm.warning))
 
 
 class Test_UV_TCPSSL(_TestSSL, tb.UVTestCase):
