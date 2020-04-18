@@ -5,15 +5,14 @@ set -e -x
 # Compile wheels
 PYTHON="/opt/python/${PYTHON_VERSION}/bin/python"
 PIP="/opt/python/${PYTHON_VERSION}/bin/pip"
-${PIP} install --upgrade pip wheel
-${PIP} install --upgrade setuptools
 ${PIP} install -r /io/.ci/requirements.txt
 make -C /io/ PYTHON="${PYTHON}" ci-clean compile
 ${PIP} wheel /io/ -w /io/dist/
 
 # Bundle external shared libraries into the wheels.
 for whl in /io/dist/*.whl; do
-    auditwheel repair $whl -w /io/dist/
+    auditwheel repair --plat="manylinux2010_${PYARCH}" \
+               $whl -w /io/dist/
     rm /io/dist/*-linux_*.whl
 done
 

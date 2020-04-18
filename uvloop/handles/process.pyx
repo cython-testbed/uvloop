@@ -28,13 +28,14 @@ cdef class UVProcess(UVHandle):
 
         global __forking
         global __forking_loop
+        global __forkHandler
 
         cdef int err
 
         self._start_init(loop)
 
-        self._handle = <uv.uv_handle_t*> \
-                            PyMem_RawMalloc(sizeof(uv.uv_process_t))
+        self._handle = <uv.uv_handle_t*>PyMem_RawMalloc(
+            sizeof(uv.uv_process_t))
         if self._handle is NULL:
             self._abort_init()
             raise MemoryError()
@@ -54,7 +55,7 @@ cdef class UVProcess(UVHandle):
                     if not os_get_inheritable(fd):
                         restore_inheritable.add(fd)
                         os_set_inheritable(fd, True)
-        except:
+        except Exception:
             self._abort_init()
             raise
 
@@ -76,8 +77,9 @@ cdef class UVProcess(UVHandle):
             loop.active_process_handler = self
             __forking = 1
             __forking_loop = loop
+            system.setForkHandler(<system.OnForkHandler>&__get_fork_handler)
 
-            _PyImport_AcquireLock()
+            PyOS_BeforeFork()
 
             err = uv.uv_spawn(loop.uvloop,
                               <uv.uv_process_t*>self._handle,
@@ -85,16 +87,10 @@ cdef class UVProcess(UVHandle):
 
             __forking = 0
             __forking_loop = None
+            system.resetForkHandler()
             loop.active_process_handler = None
 
-            if _PyImport_ReleaseLock() < 0:
-                # See CPython/posixmodule.c for details
-                self._close_process_handle()
-                if err < 0:
-                    self._abort_init()
-                else:
-                    self._close()
-                raise RuntimeError('not holding the import lock')
+            PyOS_AfterFork_Parent()
 
             if err < 0:
                 self._close_process_handle()
@@ -176,7 +172,7 @@ cdef class UVProcess(UVHandle):
         if self._restore_signals:
             _Py_RestoreSignals()
 
-        PyOS_AfterFork()
+        PyOS_AfterFork_Child()
 
         err = uv.uv_loop_fork(self._loop.uvloop)
         if err < 0:
@@ -194,6 +190,7 @@ cdef class UVProcess(UVHandle):
                         f.write(str(ex.args[0]).encode())
                 finally:
                     system._exit(255)
+                    return
             else:
                 os_close(self._errpipe_write)
         else:
@@ -440,7 +437,7 @@ cdef class UVProcessTransport(UVProcess):
 
         if _stdin is not None:
             if _stdin == subprocess_PIPE:
-                r, w  = self._file_inpipe()
+                r, w = self._file_inpipe()
                 io[0] = r
 
                 self.stdin_proto = WriteSubprocessPipeProto(self, 0)
@@ -468,7 +465,7 @@ cdef class UVProcessTransport(UVProcess):
                 # streams API. Therefore, we create pipes for stdout and
                 # stderr manually.
 
-                r, w  = self._file_outpipe()
+                r, w = self._file_outpipe()
                 io[1] = w
 
                 self.stdout_proto = ReadSubprocessPipeProto(self, 1)
@@ -490,7 +487,7 @@ cdef class UVProcessTransport(UVProcess):
 
         if _stderr is not None:
             if _stderr == subprocess_PIPE:
-                r, w  = self._file_outpipe()
+                r, w = self._file_outpipe()
                 io[2] = w
 
                 self.stderr_proto = ReadSubprocessPipeProto(self, 2)
@@ -528,7 +525,9 @@ cdef class UVProcessTransport(UVProcess):
     cdef _call_connection_made(self, waiter):
         try:
             self._protocol.connection_made(self)
-        except Exception as ex:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as ex:
             if waiter is not None and not waiter.cancelled():
                 waiter.set_exception(ex)
             else:
@@ -556,8 +555,10 @@ cdef class UVProcessTransport(UVProcess):
             return
 
         if ((self.stdin_proto is None or self.stdin_proto.disconnected) and
-            (self.stdout_proto is None or self.stdout_proto.disconnected) and
-            (self.stderr_proto is None or self.stderr_proto.disconnected)):
+                (self.stdout_proto is None or
+                    self.stdout_proto.disconnected) and
+                (self.stderr_proto is None or
+                    self.stderr_proto.disconnected)):
 
             self._finished = 1
 
@@ -603,7 +604,7 @@ cdef class UVProcessTransport(UVProcess):
 
         if handle._init_futs:
             handle._stdio_ready = 0
-            init_fut = aio_gather(*handle._init_futs, loop=loop)
+            init_fut = aio_gather(*handle._init_futs)
             init_fut.add_done_callback(
                 ft_partial(handle.__stdio_inited, waiter))
         else:

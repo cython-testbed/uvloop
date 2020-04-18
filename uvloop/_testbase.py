@@ -64,14 +64,30 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
     def new_loop(self):
         raise NotImplementedError
 
+    def new_policy(self):
+        raise NotImplementedError
+
     def mock_pattern(self, str):
         return MockPattern(str)
+
+    async def wait_closed(self, obj):
+        if not isinstance(obj, asyncio.StreamWriter):
+            return
+        if sys.version_info >= (3, 7, 0):
+            try:
+                await obj.wait_closed()
+            except (BrokenPipeError, ConnectionError):
+                pass
+
+    def has_start_serving(self):
+        return not (self.is_asyncio_loop() and
+                    sys.version_info[:2] in [(3, 5), (3, 6)])
 
     def is_asyncio_loop(self):
         return type(self.loop).__module__.startswith('asyncio.')
 
     def run_loop_briefly(self, *, delay=0.01):
-        self.loop.run_until_complete(asyncio.sleep(delay, loop=self.loop))
+        self.loop.run_until_complete(asyncio.sleep(delay))
 
     def loop_exception_handler(self, loop, context):
         self.__unhandled_exceptions.append(context)
@@ -79,16 +95,12 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
 
     def setUp(self):
         self.loop = self.new_loop()
-        asyncio.set_event_loop(None)
+        asyncio.set_event_loop_policy(self.new_policy())
+        asyncio.set_event_loop(self.loop)
         self._check_unclosed_resources_in_debug = True
 
         self.loop.set_exception_handler(self.loop_exception_handler)
         self.__unhandled_exceptions = []
-
-        if hasattr(asyncio, '_get_running_loop'):
-            # Disable `_get_running_loop`.
-            self._get_running_loop = asyncio.events._get_running_loop
-            asyncio.events._get_running_loop = lambda: None
 
         self.PY37 = sys.version_info[:2] >= (3, 7)
         self.PY36 = sys.version_info[:2] >= (3, 6)
@@ -101,9 +113,6 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
             pprint.pprint(self.__unhandled_exceptions)
             self.fail('unexpected calls to loop.call_exception_handler()')
             return
-
-        if hasattr(asyncio, '_get_running_loop'):
-            asyncio.events._get_running_loop = self._get_running_loop
 
         if not self._check_unclosed_resources_in_debug:
             return
@@ -150,6 +159,7 @@ class BaseTestCase(unittest.TestCase, metaclass=BaseTestCaseMeta):
                         'total != closed for {}'.format(h_name))
 
         asyncio.set_event_loop(None)
+        asyncio.set_event_loop_policy(None)
         self.loop = None
 
     def skip_unclosed_handles_check(self):
@@ -267,7 +277,10 @@ def find_free_port(start_from=50000):
 class SSLTestCase:
 
     def _create_server_ssl_context(self, certfile, keyfile=None):
-        sslcontext = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        if hasattr(ssl, 'PROTOCOL_TLS'):
+            sslcontext = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        else:
+            sslcontext = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
         sslcontext.options |= ssl.OP_NO_SSLv2
         sslcontext.load_cert_chain(certfile, keyfile)
         return sslcontext
@@ -298,6 +311,9 @@ class UVTestCase(BaseTestCase):
     def new_loop(self):
         return uvloop.new_event_loop()
 
+    def new_policy(self):
+        return uvloop.EventLoopPolicy()
+
 
 class AIOTestCase(BaseTestCase):
 
@@ -316,6 +332,9 @@ class AIOTestCase(BaseTestCase):
 
     def new_loop(self):
         return asyncio.new_event_loop()
+
+    def new_policy(self):
+        return asyncio.DefaultEventLoopPolicy()
 
 
 def has_IPv6():
@@ -405,7 +424,9 @@ class TestThreadedClient(SocketThread):
     def run(self):
         try:
             self._prog(TestSocketWrapper(self._sock))
-        except Exception as ex:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as ex:
             self._test._abort_socket_test(ex)
 
 
@@ -475,7 +496,9 @@ class TestThreadedServer(SocketThread):
                     try:
                         with conn:
                             self._handle_client(conn)
-                    except Exception as ex:
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException as ex:
                         self._active = False
                         try:
                             raise
@@ -516,7 +539,7 @@ def run_until(loop, pred, timeout=30):
             timeout = deadline - time.time()
             if timeout <= 0:
                 raise asyncio.futures.TimeoutError()
-        loop.run_until_complete(asyncio.tasks.sleep(0.001, loop=loop))
+        loop.run_until_complete(asyncio.tasks.sleep(0.001))
 
 
 @contextlib.contextmanager

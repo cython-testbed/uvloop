@@ -11,7 +11,7 @@ include "includes/consts.pxi"
 
 
 cdef extern from *:
-     ctypedef int vint "volatile int"
+    ctypedef int vint "volatile int"
 
 
 cdef class UVHandle
@@ -29,11 +29,9 @@ ctypedef object (*method2_t)(object, object, object)
 ctypedef object (*method3_t)(object, object, object, object)
 
 
-
 cdef class Loop:
     cdef:
         uv.uv_loop_t *uvloop
-
 
         bint _coroutine_debug_set
         int _coroutine_origin_tracking_saved_depth
@@ -67,6 +65,7 @@ cdef class Loop:
         object _ssock
         object _csock
         bint _listening_signals
+        int _old_signal_wakeup_id
 
         set _timers
         dict _polls
@@ -88,8 +87,9 @@ cdef class Loop:
         bint _recv_buffer_in_use
 
         # DEBUG fields
-        readonly bint _debug_cc  # True when compiled with DEBUG.
-                                 # Only for unittests.
+        # True when compiled with DEBUG.
+        # Used only in unittests.
+        readonly bint _debug_cc
 
         readonly object _debug_handles_total
         readonly object _debug_handles_closed
@@ -150,6 +150,8 @@ cdef class Loop:
 
     cdef void _handle_exception(self, object ex)
 
+    cdef inline _is_main_thread(self)
+
     cdef inline _new_future(self)
     cdef inline _check_signal(self, sig)
     cdef inline _check_closed(self)
@@ -161,15 +163,6 @@ cdef class Loop:
                       int unpack)
 
     cdef _getnameinfo(self, system.sockaddr *addr, int flags)
-
-    cdef _create_server(self, system.sockaddr *addr,
-                        object protocol_factory,
-                        Server server,
-                        object ssl,
-                        bint reuse_port,
-                        object backlog,
-                        object ssl_handshake_timeout,
-                        object ssl_shutdown_timeout)
 
     cdef _track_transport(self, UVBaseTransport transport)
     cdef _fileobj_to_fd(self, fileobj)
@@ -196,10 +189,9 @@ cdef class Loop:
 
     cdef _sock_set_reuseport(self, int fd)
 
-    cdef _setup_signals(self)
+    cdef _setup_or_resume_signals(self)
     cdef _shutdown_signals(self)
-    cdef _recv_signals_start(self)
-    cdef _recv_signals_stop(self)
+    cdef _pause_signals(self)
 
     cdef _handle_signal(self, sig)
     cdef _read_from_self(self)

@@ -253,7 +253,6 @@ cdef class SSLProtocol:
         self._app_transport_created = False
         # transport, ex: SelectorSocketTransport
         self._transport = None
-        self._call_connection_made = call_connection_made
         self._ssl_handshake_timeout = ssl_handshake_timeout
         self._ssl_shutdown_timeout = ssl_shutdown_timeout
         # SSL and state machine
@@ -264,7 +263,10 @@ cdef class SSLProtocol:
         self._outgoing_read = self._outgoing.read
         self._state = UNWRAPPED
         self._conn_lost = 0  # Set when connection_lost called
-        self._eof_received = False
+        if call_connection_made:
+            self._app_state = STATE_INIT
+        else:
+            self._app_state = STATE_CON_MADE
 
         # Flow Control
 
@@ -276,6 +278,7 @@ cdef class SSLProtocol:
         self._incoming_high_water = 0
         self._incoming_low_water = 0
         self._set_read_buffer_limits()
+        self._eof_received = False
 
         self._app_writing_paused = False
         self._outgoing_high_water = 0
@@ -335,16 +338,22 @@ cdef class SSLProtocol:
             self._app_transport._closed = True
 
         if self._state != DO_HANDSHAKE:
-            self._loop.call_soon(self._app_protocol.connection_lost, exc)
+            if self._app_state == STATE_CON_MADE or \
+                    self._app_state == STATE_EOF:
+                self._app_state = STATE_CON_LOST
+                self._loop.call_soon(self._app_protocol.connection_lost, exc)
         self._set_state(UNWRAPPED)
         self._transport = None
         self._app_transport = None
+        self._app_protocol = None
         self._wakeup_waiter(exc)
 
-        if getattr(self, '_shutdown_timeout_handle', None):
+        if self._shutdown_timeout_handle:
             self._shutdown_timeout_handle.cancel()
-        if getattr(self, '_handshake_timeout_handle', None):
+            self._shutdown_timeout_handle = None
+        if self._handshake_timeout_handle:
             self._handshake_timeout_handle.cancel()
+            self._handshake_timeout_handle = None
 
     def get_buffer(self, n):
         cdef size_t want = n
@@ -361,7 +370,7 @@ cdef class SSLProtocol:
 
     def buffer_updated(self, nbytes):
         self._incoming_write(PyMemoryView_FromMemory(
-                self._ssl_buffer, nbytes, PyBUF_WRITE))
+            self._ssl_buffer, nbytes, PyBUF_WRITE))
 
         if self._state == DO_HANDSHAKE:
             self._do_handshake()
@@ -383,6 +392,7 @@ cdef class SSLProtocol:
         will close itself.  If it returns a true value, closing the
         transport is up to the protocol.
         """
+        self._eof_received = True
         try:
             if self._loop.get_debug():
                 aio_logger.debug("%r received EOF", self)
@@ -392,9 +402,10 @@ cdef class SSLProtocol:
 
             elif self._state == WRAPPED:
                 self._set_state(FLUSHING)
-                self._do_write()
-                self._set_state(SHUTDOWN)
-                self._do_shutdown()
+                if self._app_reading_paused:
+                    return True
+                else:
+                    self._do_flush()
 
             elif self._state == FLUSHING:
                 self._do_write()
@@ -404,11 +415,14 @@ cdef class SSLProtocol:
             elif self._state == SHUTDOWN:
                 self._do_shutdown()
 
-        finally:
+        except Exception:
             self._transport.close()
+            raise
 
     cdef _get_extra_info(self, name, default=None):
-        if name in self._extra:
+        if name == 'uvloop.sslproto':
+            return self
+        elif name in self._extra:
             return self._extra[name]
         elif self._transport is not None:
             return self._transport.get_extra_info(name, default)
@@ -489,7 +503,9 @@ cdef class SSLProtocol:
             self._on_handshake_complete(None)
 
     cdef _on_handshake_complete(self, handshake_exc):
-        self._handshake_timeout_handle.cancel()
+        if self._handshake_timeout_handle is not None:
+            self._handshake_timeout_handle.cancel()
+            self._shutdown_timeout_handle = None
 
         sslobj = self._sslobj
         try:
@@ -506,6 +522,7 @@ cdef class SSLProtocol:
             else:
                 msg = 'SSL handshake failed'
             self._fatal_error(exc, msg)
+            self._wakeup_waiter(exc)
             return
 
         if self._loop.get_debug():
@@ -517,7 +534,8 @@ cdef class SSLProtocol:
                            cipher=sslobj.cipher(),
                            compression=sslobj.compression(),
                            ssl_object=sslobj)
-        if self._call_connection_made:
+        if self._app_state == STATE_INIT:
+            self._app_state = STATE_CON_MADE
             self._app_protocol.connection_made(self._get_app_transport())
         self._wakeup_waiter()
         self._do_read()
@@ -544,33 +562,14 @@ cdef class SSLProtocol:
                 aio_TimeoutError('SSL shutdown timed out'))
 
     cdef _do_flush(self):
-        if self._write_backlog:
-            try:
-                while True:
-                    # data is discarded when FLUSHING
-                    chunk_size = len(self._sslobj_read(SSL_READ_MAX_SIZE))
-                    if not chunk_size:
-                        # close_notify
-                        break
-            except ssl_SSLAgainErrors as exc:
-                pass
-            except ssl_SSLError as exc:
-                self._on_shutdown_complete(exc)
-                return
-
-            try:
-                self._do_write()
-            except Exception as exc:
-                self._on_shutdown_complete(exc)
-                return
-
-        if not self._write_backlog:
-            self._set_state(SHUTDOWN)
-            self._do_shutdown()
+        self._do_read()
+        self._set_state(SHUTDOWN)
+        self._do_shutdown()
 
     cdef _do_shutdown(self):
         try:
-            self._sslobj.unwrap()
+            if not self._eof_received:
+                self._sslobj.unwrap()
         except ssl_SSLAgainErrors as exc:
             self._process_outgoing()
         except ssl_SSLError as exc:
@@ -581,7 +580,9 @@ cdef class SSLProtocol:
             self._on_shutdown_complete(None)
 
     cdef _on_shutdown_complete(self, shutdown_exc):
-        self._shutdown_timeout_handle.cancel()
+        if self._shutdown_timeout_handle is not None:
+            self._shutdown_timeout_handle.cancel()
+            self._shutdown_timeout_handle = None
 
         if shutdown_exc:
             self._fatal_error(shutdown_exc)
@@ -642,7 +643,7 @@ cdef class SSLProtocol:
     # Incoming flow
 
     cdef _do_read(self):
-        if self._state != WRAPPED:
+        if self._state != WRAPPED and self._state != FLUSHING:
             return
         try:
             if not self._app_reading_paused:
@@ -734,13 +735,15 @@ cdef class SSLProtocol:
 
     cdef _call_eof_received(self):
         try:
-            if not self._eof_received:
-                self._eof_received = True
+            if self._app_state == STATE_CON_MADE:
+                self._app_state = STATE_EOF
                 keep_open = self._app_protocol.eof_received()
                 if keep_open:
                     aio_logger.warning('returning true from eof_received() '
                                        'has no effect when using ssl')
-        except Exception as ex:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as ex:
             self._fatal_error(ex, 'Error calling eof_received()')
 
     # Flow control for writes from APP socket
@@ -751,7 +754,9 @@ cdef class SSLProtocol:
             self._app_writing_paused = True
             try:
                 self._app_protocol.pause_writing()
-            except Exception as exc:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
                 self._loop.call_exception_handler({
                     'message': 'protocol.pause_writing() failed',
                     'exception': exc,
@@ -762,7 +767,9 @@ cdef class SSLProtocol:
             self._app_writing_paused = False
             try:
                 self._app_protocol.resume_writing()
-            except Exception as exc:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
                 self._loop.call_exception_handler({
                     'message': 'protocol.resume_writing() failed',
                     'exception': exc,
@@ -838,7 +845,7 @@ cdef class SSLProtocol:
         if self._transport:
             self._transport._force_close(exc)
 
-        if isinstance(exc, FATAL_SSL_ERROR_IGNORE):
+        if isinstance(exc, OSError):
             if self._loop.get_debug():
                 aio_logger.debug("%r: %s", self, message, exc_info=True)
         elif not isinstance(exc, aio_CancelledError):

@@ -124,11 +124,12 @@ class _TestTCP:
             srv = await asyncio.start_server(
                 handle_client,
                 addrs, 0,
-                family=socket.AF_INET,
-                loop=self.loop)
+                family=socket.AF_INET)
 
             srv_socks = srv.sockets
             self.assertTrue(srv_socks)
+            if self.has_start_serving():
+                self.assertTrue(srv.is_serving())
 
             addr = srv_socks[0].getsockname()
 
@@ -136,9 +137,7 @@ class _TestTCP:
             for _ in range(TOTAL_CNT):
                 tasks.append(test_client(addr))
 
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, loop=self.loop),
-                TIMEOUT, loop=self.loop)
+            await asyncio.wait_for(asyncio.gather(*tasks), TIMEOUT)
 
             self.loop.call_soon(srv.close)
             await srv.wait_closed()
@@ -146,6 +145,9 @@ class _TestTCP:
             # Check that the server cleaned-up proxy-sockets
             for srv_sock in srv_socks:
                 self.assertEqual(srv_sock.fileno(), -1)
+
+            if self.has_start_serving():
+                self.assertFalse(srv.is_serving())
 
         async def start_server_sock():
             nonlocal CNT
@@ -159,7 +161,6 @@ class _TestTCP:
                 handle_client,
                 None, None,
                 family=socket.AF_INET,
-                loop=self.loop,
                 sock=sock)
 
             if self.PY37:
@@ -167,14 +168,14 @@ class _TestTCP:
 
             srv_socks = srv.sockets
             self.assertTrue(srv_socks)
+            if self.has_start_serving():
+                self.assertTrue(srv.is_serving())
 
             tasks = []
             for _ in range(TOTAL_CNT):
                 tasks.append(test_client(addr))
 
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, loop=self.loop),
-                TIMEOUT, loop=self.loop)
+            await asyncio.wait_for(asyncio.gather(*tasks), TIMEOUT)
 
             srv.close()
             await srv.wait_closed()
@@ -182,6 +183,9 @@ class _TestTCP:
             # Check that the server cleaned-up proxy-sockets
             for srv_sock in srv_socks:
                 self.assertEqual(srv_sock.fileno(), -1)
+
+            if self.has_start_serving():
+                self.assertFalse(srv.is_serving())
 
         self.loop.run_until_complete(start_server())
         self.assertEqual(CNT, TOTAL_CNT)
@@ -206,6 +210,8 @@ class _TestTCP:
 
                 srv_socks = srv.sockets
                 self.assertTrue(srv_socks)
+                if self.has_start_serving():
+                    self.assertTrue(srv.is_serving())
 
                 host, port = srv_socks[0].getsockname()
                 self.assertNotEqual(0, port)
@@ -217,6 +223,9 @@ class _TestTCP:
                 for srv_sock in srv_socks:
                     self.assertEqual(srv_sock.fileno(), -1)
 
+                if self.has_start_serving():
+                    self.assertFalse(srv.is_serving())
+
         self.loop.run_until_complete(start_server_ephemeral_ports())
 
     def test_create_server_4(self):
@@ -227,8 +236,8 @@ class _TestTCP:
             addr = sock.getsockname()
 
             with self.assertRaisesRegex(OSError,
-                                        "error while attempting.*\('127.*: "
-                                        "address already in use"):
+                                        r"error while attempting.*\('127.*: "
+                                        r"address already in use"):
 
                 self.loop.run_until_complete(
                     self.loop.create_server(object, *addr))
@@ -315,7 +324,7 @@ class _TestTCP:
             del srv
 
             # Let all transports shutdown.
-            await asyncio.sleep(0.1, loop=self.loop)
+            await asyncio.sleep(0.1)
 
             gc.collect()
             gc.collect()
@@ -335,11 +344,62 @@ class _TestTCP:
                 self.loop.create_server(
                     lambda: None, host='::', port=0, ssl_handshake_timeout=10))
 
+    def test_create_server_9(self):
+        if not self.has_start_serving():
+            raise unittest.SkipTest()
+
+        async def handle_client(reader, writer):
+            pass
+
+        async def start_server():
+            srv = await asyncio.start_server(
+                handle_client,
+                '127.0.0.1', 0,
+                family=socket.AF_INET,
+                start_serving=False)
+
+            await srv.start_serving()
+            self.assertTrue(srv.is_serving())
+
+            # call start_serving again
+            await srv.start_serving()
+            self.assertTrue(srv.is_serving())
+
+            srv.close()
+            await srv.wait_closed()
+            self.assertFalse(srv.is_serving())
+
+        self.loop.run_until_complete(start_server())
+
+    def test_create_server_10(self):
+        if not self.has_start_serving():
+            raise unittest.SkipTest()
+
+        async def handle_client(reader, writer):
+            pass
+
+        async def start_server():
+            srv = await asyncio.start_server(
+                handle_client,
+                '127.0.0.1', 0,
+                family=socket.AF_INET,
+                start_serving=False)
+
+            async with srv:
+                fut = asyncio.ensure_future(srv.serve_forever())
+                await asyncio.sleep(0)
+                self.assertTrue(srv.is_serving())
+
+                fut.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await fut
+                self.assertFalse(srv.is_serving())
+
+        self.loop.run_until_complete(start_server())
+
     def test_create_connection_open_con_addr(self):
         async def client(addr):
-            reader, writer = await asyncio.open_connection(
-                *addr,
-                loop=self.loop)
+            reader, writer = await asyncio.open_connection(*addr)
 
             writer.write(b'AAAA')
             self.assertEqual(await reader.readexactly(2), b'OK')
@@ -358,6 +418,7 @@ class _TestTCP:
                     sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
 
             writer.close()
+            await self.wait_closed(writer)
 
         self._test_create_connection_1(client)
 
@@ -365,9 +426,7 @@ class _TestTCP:
         async def client(addr):
             sock = socket.socket()
             sock.connect(addr)
-            reader, writer = await asyncio.open_connection(
-                sock=sock,
-                loop=self.loop)
+            reader, writer = await asyncio.open_connection(sock=sock)
 
             writer.write(b'AAAA')
             self.assertEqual(await reader.readexactly(2), b'OK')
@@ -382,6 +441,7 @@ class _TestTCP:
                     sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
 
             writer.close()
+            await self.wait_closed(writer)
 
         self._test_create_connection_1(client)
 
@@ -414,8 +474,7 @@ class _TestTCP:
                 for _ in range(TOTAL_CNT):
                     tasks.append(coro(srv.addr))
 
-                self.loop.run_until_complete(
-                    asyncio.gather(*tasks, loop=self.loop))
+                self.loop.run_until_complete(asyncio.gather(*tasks))
 
             self.assertEqual(CNT, TOTAL_CNT)
 
@@ -428,9 +487,9 @@ class _TestTCP:
             addr = sock.getsockname()
 
         async def client():
-            reader, writer = await asyncio.open_connection(
-                *addr,
-                loop=self.loop)
+            reader, writer = await asyncio.open_connection(*addr)
+            writer.close()
+            await self.wait_closed(writer)
 
         async def runner():
             with self.assertRaises(ConnectionRefusedError):
@@ -448,9 +507,7 @@ class _TestTCP:
             sock.close()
 
         async def client(addr):
-            reader, writer = await asyncio.open_connection(
-                *addr,
-                loop=self.loop)
+            reader, writer = await asyncio.open_connection(*addr)
 
             writer.write(b'AAAA')
 
@@ -458,6 +515,7 @@ class _TestTCP:
                 await reader.readexactly(10)
 
             writer.close()
+            await self.wait_closed(writer)
 
             nonlocal CNT
             CNT += 1
@@ -473,8 +531,7 @@ class _TestTCP:
                 for _ in range(TOTAL_CNT):
                     tasks.append(coro(srv.addr))
 
-                self.loop.run_until_complete(
-                    asyncio.gather(*tasks, loop=self.loop))
+                self.loop.run_until_complete(asyncio.gather(*tasks))
 
             self.assertEqual(CNT, TOTAL_CNT)
 
@@ -485,9 +542,9 @@ class _TestTCP:
         sock.close()
 
         async def client():
-            reader, writer = await asyncio.open_connection(
-                sock=sock,
-                loop=self.loop)
+            reader, writer = await asyncio.open_connection(sock=sock)
+            writer.close()
+            await self.wait_closed(writer)
 
         async def runner():
             with self.assertRaisesRegex(OSError, 'Bad file'):
@@ -506,9 +563,8 @@ class _TestTCP:
 
         async def client(addr):
             fut = asyncio.ensure_future(
-                self.loop.create_connection(asyncio.Protocol, *addr),
-                loop=self.loop)
-            await asyncio.sleep(0, loop=self.loop)
+                self.loop.create_connection(asyncio.Protocol, *addr))
+            await asyncio.sleep(0)
             fut.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await fut
@@ -549,15 +605,14 @@ class _TestTCP:
             CNT += 1
 
         async def test_client(addr):
-            reader, writer = await asyncio.open_connection(
-                *addr,
-                loop=self.loop)
+            reader, writer = await asyncio.open_connection(*addr)
 
             writer.write(b'AAAA')
             data = await reader.readexactly(2)
             self.assertEqual(data, b'OK')
 
             writer.close()
+            await self.wait_closed(writer)
 
         async def start_server():
             nonlocal CNT
@@ -566,8 +621,7 @@ class _TestTCP:
             srv = await asyncio.start_server(
                 handle_client,
                 '127.0.0.1', 0,
-                family=socket.AF_INET,
-                loop=self.loop)
+                family=socket.AF_INET)
 
             srv_socks = srv.sockets
             self.assertTrue(srv_socks)
@@ -578,9 +632,7 @@ class _TestTCP:
             for _ in range(TOTAL_CNT):
                 tasks.append(test_client(addr))
 
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, loop=self.loop),
-                TIMEOUT, loop=self.loop)
+            await asyncio.wait_for(asyncio.gather(*tasks), TIMEOUT)
 
             srv.close()
             await srv.wait_closed()
@@ -595,8 +647,8 @@ class _TestTCP:
         # Silence error logging
         self.loop.set_exception_handler(lambda *args: None)
 
-        fut = asyncio.Future(loop=self.loop)
-        connection_lost_called = asyncio.Future(loop=self.loop)
+        fut = asyncio.Future()
+        connection_lost_called = asyncio.Future()
 
         async def server(reader, writer):
             try:
@@ -614,14 +666,13 @@ class _TestTCP:
         srv = self.loop.run_until_complete(asyncio.start_server(
             server,
             '127.0.0.1', 0,
-            family=socket.AF_INET,
-            loop=self.loop))
+            family=socket.AF_INET))
 
         async def runner():
             tr, pr = await asyncio.wait_for(
                 self.loop.create_connection(
                     Proto, *srv.sockets[0].getsockname()),
-                timeout=1.0, loop=self.loop)
+                timeout=1.0)
             fut.set_result(None)
             tr.close()
 
@@ -639,7 +690,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
     def test_create_server_buffered_1(self):
         SIZE = 123123
         eof = False
-        done = False
+        fut = asyncio.Future()
 
         class Proto(asyncio.BaseProtocol):
             def connection_made(self, tr):
@@ -661,8 +712,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
                 eof = True
 
             def connection_lost(self, exc):
-                nonlocal done
-                done = exc
+                fut.set_result(exc)
 
         async def test():
             port = tb.find_free_port()
@@ -680,8 +730,9 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
             await srv.wait_closed()
 
         self.loop.run_until_complete(test())
+        self.loop.run_until_complete(fut)
         self.assertTrue(eof)
-        self.assertIsNone(done)
+        self.assertIsNone(fut.result())
 
     def test_create_server_buffered_2(self):
         class ProtoExc(asyncio.BaseProtocol):
@@ -797,11 +848,11 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         # This tests is only for uvloop.  asyncio should pass it
         # too in Python 3.6.
 
-        fut = asyncio.Future(loop=self.loop)
+        fut = asyncio.Future()
 
         async def handle_client(reader, writer):
             with self.assertRaises(asyncio.IncompleteReadError):
-                data = await reader.readexactly(4)
+                await reader.readexactly(4)
             writer.close()
 
             # Previously, when we used socket.fromfd to create a socket
@@ -878,8 +929,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
             srv = await asyncio.start_server(
                 handle_client,
                 '127.0.0.1', 0,
-                family=socket.AF_INET,
-                loop=self.loop)
+                family=socket.AF_INET)
 
             addr = srv.sockets[0].getsockname()
             await test_client(addr)
@@ -922,11 +972,10 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
             srv = await asyncio.start_server(
                 server,
                 '127.0.0.1', 0,
-                family=socket.AF_INET,
-                loop=self.loop)
+                family=socket.AF_INET)
 
             addr = srv.sockets[0].getsockname()
-            r, w = await asyncio.open_connection(*addr, loop=self.loop)
+            r, w = await asyncio.open_connection(*addr)
 
             DATA = b'x' * 102400
 
@@ -955,6 +1004,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
 
             w.close()
             await fut
+            await self.wait_closed(w)
 
             srv.close()
             await srv.wait_closed()
@@ -963,6 +1013,8 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
 
         self.loop.run_until_complete(run())
 
+    @unittest.skipIf(sys.version_info[:3] >= (3, 8, 0),
+                     "3.8 has a different method of GCing unclosed streams")
     def test_tcp_handle_unclosed_gc(self):
         fut = self.loop.create_future()
 
@@ -972,7 +1024,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
 
         async def run():
             addr = srv.sockets[0].getsockname()
-            await asyncio.open_connection(*addr, loop=self.loop)
+            await asyncio.open_connection(*addr)
             await fut
             srv.close()
             await srv.wait_closed()
@@ -980,8 +1032,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         srv = self.loop.run_until_complete(asyncio.start_server(
             server,
             '127.0.0.1', 0,
-            family=socket.AF_INET,
-            loop=self.loop))
+            family=socket.AF_INET))
 
         if self.loop.get_debug():
             rx = r'unclosed resource <TCP.*; ' \
@@ -992,14 +1043,14 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         with self.assertWarnsRegex(ResourceWarning, rx):
             self.loop.create_task(run())
             self.loop.run_until_complete(srv.wait_closed())
-            self.loop.run_until_complete(asyncio.sleep(0.1, loop=self.loop))
+            self.loop.run_until_complete(asyncio.sleep(0.1))
 
             srv = None
             gc.collect()
             gc.collect()
             gc.collect()
 
-            self.loop.run_until_complete(asyncio.sleep(0.1, loop=self.loop))
+            self.loop.run_until_complete(asyncio.sleep(0.1))
 
         # Since one TCPTransport handle wasn't closed correctly,
         # we need to disable this check:
@@ -1019,14 +1070,13 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
         srv = self.loop.run_until_complete(asyncio.start_server(
             server,
             '127.0.0.1', 0,
-            family=socket.AF_INET,
-            loop=self.loop))
+            family=socket.AF_INET))
 
         async def runner():
             tr, pr = await asyncio.wait_for(
                 self.loop.create_connection(
                     Proto, *srv.sockets[0].getsockname()),
-                timeout=1.0, loop=self.loop)
+                timeout=1.0)
 
             # Asyncio would return a closed socket, which we
             # can't do: the transport was aborted, hence there
@@ -1118,7 +1168,7 @@ class Test_UV_TCP(_TestTCP, tb.UVTestCase):
 
         tr.close()
         # let it close
-        self.loop.run_until_complete(asyncio.sleep(0.1, loop=self.loop))
+        self.loop.run_until_complete(asyncio.sleep(0.1))
 
     @unittest.skipUnless(hasattr(socket, 'AF_UNIX'), 'no Unix sockets')
     def test_create_connection_wrong_sock(self):
@@ -1232,7 +1282,7 @@ class _TestSSL(tb.SSLTestCase):
             CNT += 1
 
         async def test_client(addr):
-            fut = asyncio.Future(loop=self.loop)
+            fut = asyncio.Future()
 
             def prog(sock):
                 try:
@@ -1270,7 +1320,6 @@ class _TestSSL(tb.SSLTestCase):
                 '127.0.0.1', 0,
                 family=socket.AF_INET,
                 ssl=sslctx,
-                loop=self.loop,
                 **extras)
 
             try:
@@ -1283,9 +1332,7 @@ class _TestSSL(tb.SSLTestCase):
                 for _ in range(TOTAL_CNT):
                     tasks.append(test_client(addr))
 
-                await asyncio.wait_for(
-                    asyncio.gather(*tasks, loop=self.loop),
-                    TIMEOUT, loop=self.loop)
+                await asyncio.wait_for(asyncio.gather(*tasks), TIMEOUT)
 
             finally:
                 self.loop.call_soon(srv.close)
@@ -1337,7 +1384,6 @@ class _TestSSL(tb.SSLTestCase):
                 *addr,
                 ssl=client_sslctx,
                 server_hostname='',
-                loop=self.loop,
                 **extras)
 
             writer.write(A_DATA)
@@ -1350,6 +1396,7 @@ class _TestSSL(tb.SSLTestCase):
             CNT += 1
 
             writer.close()
+            await self.wait_closed(writer)
 
         async def client_sock(addr):
             sock = socket.socket()
@@ -1357,8 +1404,7 @@ class _TestSSL(tb.SSLTestCase):
             reader, writer = await asyncio.open_connection(
                 sock=sock,
                 ssl=client_sslctx,
-                server_hostname='',
-                loop=self.loop)
+                server_hostname='')
 
             writer.write(A_DATA)
             self.assertEqual(await reader.readexactly(2), b'OK')
@@ -1370,6 +1416,7 @@ class _TestSSL(tb.SSLTestCase):
             CNT += 1
 
             writer.close()
+            await self.wait_closed(writer)
             sock.close()
 
         def run(coro):
@@ -1383,8 +1430,7 @@ class _TestSSL(tb.SSLTestCase):
                 for _ in range(TOTAL_CNT):
                     tasks.append(coro(srv.addr))
 
-                self.loop.run_until_complete(
-                    asyncio.gather(*tasks, loop=self.loop))
+                self.loop.run_until_complete(asyncio.gather(*tasks))
 
             self.assertEqual(CNT, TOTAL_CNT)
 
@@ -1416,8 +1462,9 @@ class _TestSSL(tb.SSLTestCase):
                 *addr,
                 ssl=client_sslctx,
                 server_hostname='',
-                loop=self.loop,
                 ssl_handshake_timeout=1.0)
+            writer.close()
+            await self.wait_closed(writer)
 
         with self.tcp_server(server,
                              max_clients=1,
@@ -1455,8 +1502,9 @@ class _TestSSL(tb.SSLTestCase):
                 *addr,
                 ssl=client_sslctx,
                 server_hostname='',
-                loop=self.loop,
                 ssl_handshake_timeout=1.0)
+            writer.close()
+            await self.wait_closed(writer)
 
         with self.tcp_server(server,
                              max_clients=1,
@@ -1514,8 +1562,7 @@ class _TestSSL(tb.SSLTestCase):
                     ssl=client_sslctx,
                     server_hostname='',
                     ssl_handshake_timeout=10.0),
-                0.5,
-                loop=self.loop)
+                0.5)
 
         with self.tcp_server(server,
                              max_clients=1,
@@ -1530,14 +1577,67 @@ class _TestSSL(tb.SSLTestCase):
         # exception or log an error, even if the handshake failed
         self.assertEqual(messages, [])
 
+    def test_ssl_handshake_connection_lost(self):
+        # #246: make sure that no connection_lost() is called before
+        # connection_made() is called first
+
+        client_sslctx = self._create_client_ssl_context()
+
+        # silence error logger
+        self.loop.set_exception_handler(lambda loop, ctx: None)
+
+        connection_made_called = False
+        connection_lost_called = False
+
+        def server(sock):
+            sock.recv(1024)
+            # break the connection during handshake
+            sock.close()
+
+        class ClientProto(asyncio.Protocol):
+            def connection_made(self, transport):
+                nonlocal connection_made_called
+                connection_made_called = True
+
+            def connection_lost(self, exc):
+                nonlocal connection_lost_called
+                connection_lost_called = True
+
+        async def client(addr):
+            await self.loop.create_connection(
+                ClientProto,
+                *addr,
+                ssl=client_sslctx,
+                server_hostname=''),
+
+        with self.tcp_server(server,
+                             max_clients=1,
+                             backlog=1) as srv:
+
+            with self.assertRaises(ConnectionResetError):
+                self.loop.run_until_complete(client(srv.addr))
+
+        if connection_lost_called:
+            if connection_made_called:
+                self.fail("unexpected call to connection_lost()")
+            else:
+                self.fail("unexpected call to connection_lost() without"
+                          "calling connection_made()")
+        elif connection_made_called:
+            self.fail("unexpected call to connection_made()")
+
     def test_ssl_connect_accepted_socket(self):
-        server_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        if hasattr(ssl, 'PROTOCOL_TLS'):
+            proto = ssl.PROTOCOL_TLS
+        else:
+            proto = ssl.PROTOCOL_SSLv23
+        server_context = ssl.SSLContext(proto)
         server_context.load_cert_chain(self.ONLYCERT, self.ONLYKEY)
         if hasattr(server_context, 'check_hostname'):
             server_context.check_hostname = False
         server_context.verify_mode = ssl.CERT_NONE
 
-        client_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        client_context = ssl.SSLContext(proto)
         if hasattr(server_context, 'check_hostname'):
             client_context.check_hostname = False
         client_context.verify_mode = ssl.CERT_NONE
@@ -1573,14 +1673,17 @@ class _TestSSL(tb.SSLTestCase):
             reader, writer = await asyncio.open_connection(
                 *addr,
                 ssl=client_sslctx,
-                server_hostname='',
-                loop=self.loop)
+                server_hostname='')
 
             self.assertEqual(await reader.readline(), b'A\n')
             writer.write(b'B')
             with self.assertRaises(ssl.SSLError):
                 await reader.readline()
             writer.close()
+            try:
+                await self.wait_closed(writer)
+            except ssl.SSLError:
+                pass
             return 'OK'
 
         with self.tcp_server(server,
@@ -1634,7 +1737,7 @@ class _TestSSL(tb.SSLTestCase):
                 self.on_eof.set_result(True)
 
         async def client(addr):
-            await asyncio.sleep(0.5, loop=self.loop)
+            await asyncio.sleep(0.5)
 
             on_data = self.loop.create_future()
             on_eof = self.loop.create_future()
@@ -1653,7 +1756,73 @@ class _TestSSL(tb.SSLTestCase):
 
         with self.tcp_server(serve, timeout=self.TIMEOUT) as srv:
             self.loop.run_until_complete(
-                asyncio.wait_for(client(srv.addr), loop=self.loop, timeout=10))
+                asyncio.wait_for(client(srv.addr), timeout=10))
+
+    def test_create_connection_memory_leak(self):
+        if self.implementation == 'asyncio':
+            raise unittest.SkipTest()
+
+        HELLO_MSG = b'1' * self.PAYLOAD_SIZE
+
+        server_context = self._create_server_ssl_context(
+            self.ONLYCERT, self.ONLYKEY)
+        client_context = self._create_client_ssl_context()
+
+        def serve(sock):
+            sock.settimeout(self.TIMEOUT)
+
+            sock.starttls(server_context, server_side=True)
+
+            sock.sendall(b'O')
+            data = sock.recv_all(len(HELLO_MSG))
+            self.assertEqual(len(data), len(HELLO_MSG))
+
+            sock.unwrap()
+            sock.close()
+
+        class ClientProto(asyncio.Protocol):
+            def __init__(self, on_data, on_eof):
+                self.on_data = on_data
+                self.on_eof = on_eof
+                self.con_made_cnt = 0
+
+            def connection_made(proto, tr):
+                # XXX: We assume user stores the transport in protocol
+                proto.tr = tr
+                proto.con_made_cnt += 1
+                # Ensure connection_made gets called only once.
+                self.assertEqual(proto.con_made_cnt, 1)
+
+            def data_received(self, data):
+                self.on_data.set_result(data)
+
+            def eof_received(self):
+                self.on_eof.set_result(True)
+
+        async def client(addr):
+            await asyncio.sleep(0.5)
+
+            on_data = self.loop.create_future()
+            on_eof = self.loop.create_future()
+
+            tr, proto = await self.loop.create_connection(
+                lambda: ClientProto(on_data, on_eof), *addr,
+                ssl=client_context)
+
+            self.assertEqual(await on_data, b'O')
+            tr.write(HELLO_MSG)
+            await on_eof
+
+            tr.close()
+
+        with self.tcp_server(serve, timeout=self.TIMEOUT) as srv:
+            self.loop.run_until_complete(
+                asyncio.wait_for(client(srv.addr), timeout=10))
+
+        # No garbage is left for SSL client from loop.create_connection, even
+        # if user stores the SSLTransport in corresponding protocol instance
+        client_context = weakref.ref(client_context)
+        self.assertIsNone(client_context())
 
     def test_start_tls_client_buf_proto_1(self):
         if self.implementation == 'asyncio':
@@ -1722,7 +1891,7 @@ class _TestSSL(tb.SSLTestCase):
                 self.on_eof.set_result(True)
 
         async def client(addr):
-            await asyncio.sleep(0.5, loop=self.loop)
+            await asyncio.sleep(0.5)
 
             on_data1 = self.loop.create_future()
             on_data2 = self.loop.create_future()
@@ -1752,7 +1921,7 @@ class _TestSSL(tb.SSLTestCase):
         with self.tcp_server(serve, timeout=self.TIMEOUT) as srv:
             self.loop.run_until_complete(
                 asyncio.wait_for(client(srv.addr),
-                                 loop=self.loop, timeout=self.TIMEOUT))
+                                 timeout=self.TIMEOUT))
 
     def test_start_tls_slow_client_cancel(self):
         if self.implementation == 'asyncio':
@@ -1796,7 +1965,7 @@ class _TestSSL(tb.SSLTestCase):
                 self.on_eof.set_result(True)
 
         async def client(addr):
-            await asyncio.sleep(0.5, loop=self.loop)
+            await asyncio.sleep(0.5)
 
             on_data = self.loop.create_future()
             on_eof = self.loop.create_future()
@@ -1811,12 +1980,11 @@ class _TestSSL(tb.SSLTestCase):
             with self.assertRaises(asyncio.TimeoutError):
                 await asyncio.wait_for(
                     self.loop.start_tls(tr, proto, client_context),
-                    0.5,
-                    loop=self.loop)
+                    0.5)
 
         with self.tcp_server(serve, timeout=self.TIMEOUT) as srv:
             self.loop.run_until_complete(
-                asyncio.wait_for(client(srv.addr), loop=self.loop, timeout=10))
+                asyncio.wait_for(client(srv.addr), timeout=10))
 
     def test_start_tls_server_1(self):
         if self.implementation == 'asyncio':
@@ -1893,7 +2061,7 @@ class _TestSSL(tb.SSLTestCase):
                                  timeout=self.TIMEOUT):
                 await asyncio.wait_for(
                     main(proto, on_con, on_eof, on_con_lost),
-                    loop=self.loop, timeout=self.TIMEOUT)
+                    timeout=self.TIMEOUT)
 
             server.close()
             await server.wait_closed()
@@ -1951,12 +2119,12 @@ class _TestSSL(tb.SSLTestCase):
                 fut.add_done_callback(cb)
 
         def server_protocol_factory():
-            reader = asyncio.StreamReader(loop=self.loop)
-            protocol = ServerProtocol(reader, handle_client, loop=self.loop)
+            reader = asyncio.StreamReader()
+            protocol = ServerProtocol(reader, handle_client)
             return protocol
 
         async def test_client(addr):
-            fut = asyncio.Future(loop=self.loop)
+            fut = asyncio.Future()
 
             def prog(sock):
                 try:
@@ -2034,9 +2202,7 @@ class _TestSSL(tb.SSLTestCase):
                 for _ in range(TOTAL_CNT):
                     tasks.append(test_client(addr))
 
-                await asyncio.wait_for(
-                    asyncio.gather(*tasks, loop=self.loop),
-                    TIMEOUT, loop=self.loop)
+                await asyncio.wait_for(asyncio.gather(*tasks), TIMEOUT)
 
             finally:
                 self.loop.call_soon(srv.close)
@@ -2060,12 +2226,14 @@ class _TestSSL(tb.SSLTestCase):
         A_DATA = b'A' * 1024 * 1024
         B_DATA = b'B' * 1024 * 1024
 
-        sslctx = openssl_ssl.Context(openssl_ssl.SSLv23_METHOD)
+        sslctx = openssl_ssl.Context(openssl_ssl.TLSv1_2_METHOD)
         if hasattr(openssl_ssl, 'OP_NO_SSLV2'):
             sslctx.set_options(openssl_ssl.OP_NO_SSLV2)
         sslctx.use_privatekey_file(self.ONLYKEY)
         sslctx.use_certificate_chain_file(self.ONLYCERT)
         client_sslctx = self._create_client_ssl_context()
+        if hasattr(ssl, 'OP_NO_TLSv1_3'):
+            client_sslctx.options |= ssl.OP_NO_TLSv1_3
 
         def server(sock):
             conn = openssl_ssl.Connection(sslctx, sock)
@@ -2113,7 +2281,6 @@ class _TestSSL(tb.SSLTestCase):
                 *addr,
                 ssl=client_sslctx,
                 server_hostname='',
-                loop=self.loop,
                 **extras)
 
             writer.write(A_DATA)
@@ -2126,6 +2293,7 @@ class _TestSSL(tb.SSLTestCase):
             CNT += 1
 
             writer.close()
+            await self.wait_closed(writer)
 
         async def client_sock(addr):
             sock = socket.socket()
@@ -2133,8 +2301,7 @@ class _TestSSL(tb.SSLTestCase):
             reader, writer = await asyncio.open_connection(
                 sock=sock,
                 ssl=client_sslctx,
-                server_hostname='',
-                loop=self.loop)
+                server_hostname='')
 
             writer.write(A_DATA)
             self.assertEqual(await reader.readexactly(2), b'OK')
@@ -2146,6 +2313,7 @@ class _TestSSL(tb.SSLTestCase):
             CNT += 1
 
             writer.close()
+            await self.wait_closed(writer)
             sock.close()
 
         def run(coro):
@@ -2160,7 +2328,7 @@ class _TestSSL(tb.SSLTestCase):
                     tasks.append(coro(srv.addr))
 
                 self.loop.run_until_complete(
-                    asyncio.gather(*tasks, loop=self.loop))
+                    asyncio.gather(*tasks))
 
             self.assertEqual(CNT, TOTAL_CNT)
 
@@ -2199,7 +2367,7 @@ class _TestSSL(tb.SSLTestCase):
             CNT += 1
 
         async def test_client(addr):
-            fut = asyncio.Future(loop=self.loop)
+            fut = asyncio.Future()
 
             def prog(sock):
                 try:
@@ -2242,7 +2410,6 @@ class _TestSSL(tb.SSLTestCase):
                 '127.0.0.1', 0,
                 family=socket.AF_INET,
                 ssl=sslctx,
-                loop=self.loop,
                 **extras)
 
             try:
@@ -2256,8 +2423,8 @@ class _TestSSL(tb.SSLTestCase):
                     tasks.append(test_client(addr))
 
                 await asyncio.wait_for(
-                    asyncio.gather(*tasks, loop=self.loop),
-                    TIMEOUT, loop=self.loop)
+                    asyncio.gather(*tasks),
+                    TIMEOUT)
 
             finally:
                 self.loop.call_soon(srv.close)
@@ -2305,7 +2472,6 @@ class _TestSSL(tb.SSLTestCase):
                 *addr,
                 ssl=client_sslctx,
                 server_hostname='',
-                loop=self.loop,
                 **extras)
 
             writer.write(A_DATA)
@@ -2317,6 +2483,7 @@ class _TestSSL(tb.SSLTestCase):
             CNT += 1
 
             writer.close()
+            await self.wait_closed(writer)
 
         def run(coro):
             nonlocal CNT
@@ -2330,7 +2497,7 @@ class _TestSSL(tb.SSLTestCase):
                     tasks.append(coro(srv.addr))
 
                 self.loop.run_until_complete(
-                    asyncio.gather(*tasks, loop=self.loop))
+                    asyncio.gather(*tasks))
 
             self.assertEqual(CNT, TOTAL_CNT)
 
@@ -2374,8 +2541,7 @@ class _TestSSL(tb.SSLTestCase):
             reader, writer = await asyncio.open_connection(
                 *addr,
                 ssl=client_sslctx,
-                server_hostname='',
-                loop=self.loop)
+                server_hostname='')
             writer.write(b'I AM WRITING NOWHERE1' * 100)
 
             try:
@@ -2391,6 +2557,9 @@ class _TestSSL(tb.SSLTestCase):
                 writer.transport.get_write_buffer_size(), 0)
 
             await future
+
+            writer.close()
+            await self.wait_closed(writer)
 
         def run(meth):
             def wrapper(sock):
@@ -2417,12 +2586,14 @@ class _TestSSL(tb.SSLTestCase):
         SIZE = 32
 
         sslctx = self._create_server_ssl_context(self.ONLYCERT, self.ONLYKEY)
-        sslctx_openssl = openssl_ssl.Context(openssl_ssl.SSLv23_METHOD)
+        sslctx_openssl = openssl_ssl.Context(openssl_ssl.TLSv1_2_METHOD)
         if hasattr(openssl_ssl, 'OP_NO_SSLV2'):
             sslctx_openssl.set_options(openssl_ssl.OP_NO_SSLV2)
         sslctx_openssl.use_privatekey_file(self.ONLYKEY)
         sslctx_openssl.use_certificate_chain_file(self.ONLYCERT)
         client_sslctx = self._create_client_ssl_context()
+        if hasattr(ssl, 'OP_NO_TLSv1_3'):
+            client_sslctx.options |= ssl.OP_NO_TLSv1_3
 
         future = None
 
@@ -2434,35 +2605,6 @@ class _TestSSL(tb.SSLTestCase):
             data = sock.recv_all(CHUNK * SIZE)
             self.assertEqual(len(data), CHUNK * SIZE)
             sock.close()
-
-        def openssl_server(sock):
-            conn = openssl_ssl.Connection(sslctx_openssl, sock)
-            conn.set_accept_state()
-
-            while True:
-                try:
-                    data = conn.recv(16384)
-                    self.assertEqual(data, b'ping')
-                    break
-                except openssl_ssl.WantReadError:
-                    pass
-
-            # use renegotiation to queue data in peer _write_backlog
-            conn.renegotiate()
-            conn.send(b'pong')
-
-            data_size = 0
-            while True:
-                try:
-                    chunk = conn.recv(16384)
-                    if not chunk:
-                        break
-                    data_size += len(chunk)
-                except openssl_ssl.WantReadError:
-                    pass
-                except openssl_ssl.ZeroReturnError:
-                    break
-            self.assertEqual(data_size, CHUNK * SIZE)
 
         def run(meth):
             def wrapper(sock):
@@ -2480,14 +2622,20 @@ class _TestSSL(tb.SSLTestCase):
             reader, writer = await asyncio.open_connection(
                 *addr,
                 ssl=client_sslctx,
-                server_hostname='',
-                loop=self.loop)
+                server_hostname='')
+            sslprotocol = writer.get_extra_info('uvloop.sslproto')
             writer.write(b'ping')
             data = await reader.readexactly(4)
             self.assertEqual(data, b'pong')
+
+            sslprotocol.pause_writing()
             for _ in range(SIZE):
                 writer.write(b'x' * CHUNK)
+
             writer.close()
+            sslprotocol.resume_writing()
+
+            await self.wait_closed(writer)
             try:
                 data = await reader.read()
                 self.assertEqual(data, b'')
@@ -2496,9 +2644,6 @@ class _TestSSL(tb.SSLTestCase):
             await future
 
         with self.tcp_server(run(server)) as srv:
-            self.loop.run_until_complete(client(srv.addr))
-
-        with self.tcp_server(run(openssl_server)) as srv:
             self.loop.run_until_complete(client(srv.addr))
 
     def test_remote_shutdown_receives_trailing_data(self):
@@ -2589,8 +2734,7 @@ class _TestSSL(tb.SSLTestCase):
             reader, writer = await asyncio.open_connection(
                 *addr,
                 ssl=client_sslctx,
-                server_hostname='',
-                loop=self.loop)
+                server_hostname='')
             writer.write(b'ping')
             data = await reader.readexactly(4)
             self.assertEqual(data, b'pong')
@@ -2606,6 +2750,9 @@ class _TestSSL(tb.SSLTestCase):
                 pass
 
             await future
+
+            writer.close()
+            await self.wait_closed(writer)
 
         def run(meth):
             def wrapper(sock):
@@ -2633,7 +2780,7 @@ class _TestSSL(tb.SSLTestCase):
                 await asyncio.wait_for(
                     self.loop.create_connection(asyncio.Protocol,
                                                 *addr, ssl=True),
-                    0.1, loop=self.loop)
+                    0.1)
             except (ConnectionRefusedError, asyncio.TimeoutError):
                 pass
             else:
@@ -2650,6 +2797,127 @@ class _TestSSL(tb.SSLTestCase):
                 self.assertEqual(str(e), 'ResourceWarning not triggered')
             else:
                 self.fail('Unexpected ResourceWarning: {}'.format(cm.warning))
+
+    def test_handshake_timeout_handler_leak(self):
+        if self.implementation == 'asyncio':
+            # Okay this turns out to be an issue for asyncio.sslproto too
+            raise unittest.SkipTest()
+
+        s = socket.socket(socket.AF_INET)
+        s.bind(('127.0.0.1', 0))
+        s.listen(1)
+        addr = s.getsockname()
+
+        async def test(ctx):
+            try:
+                await asyncio.wait_for(
+                    self.loop.create_connection(asyncio.Protocol, *addr,
+                                                ssl=ctx),
+                    0.1)
+            except (ConnectionRefusedError, asyncio.TimeoutError):
+                pass
+            else:
+                self.fail('TimeoutError is not raised')
+
+        with s:
+            ctx = ssl.create_default_context()
+            self.loop.run_until_complete(test(ctx))
+            ctx = weakref.ref(ctx)
+
+        # SSLProtocol should be DECREF to 0
+        self.assertIsNone(ctx())
+
+    def test_shutdown_timeout_handler_leak(self):
+        loop = self.loop
+
+        def server(sock):
+            sslctx = self._create_server_ssl_context(self.ONLYCERT,
+                                                     self.ONLYKEY)
+            sock = sslctx.wrap_socket(sock, server_side=True)
+            sock.recv(32)
+            sock.close()
+
+        class Protocol(asyncio.Protocol):
+            def __init__(self):
+                self.fut = asyncio.Future(loop=loop)
+
+            def connection_lost(self, exc):
+                self.fut.set_result(None)
+
+        async def client(addr, ctx):
+            tr, pr = await loop.create_connection(Protocol, *addr, ssl=ctx)
+            tr.close()
+            await pr.fut
+
+        with self.tcp_server(server) as srv:
+            ctx = self._create_client_ssl_context()
+            loop.run_until_complete(client(srv.addr, ctx))
+            ctx = weakref.ref(ctx)
+
+        if self.implementation == 'asyncio':
+            # asyncio has no shutdown timeout, but it ends up with a circular
+            # reference loop - not ideal (introduces gc glitches), but at least
+            # not leaking
+            gc.collect()
+            gc.collect()
+            gc.collect()
+
+        # SSLProtocol should be DECREF to 0
+        self.assertIsNone(ctx())
+
+    def test_shutdown_timeout_handler_not_set(self):
+        loop = self.loop
+        eof = asyncio.Event()
+        extra = None
+
+        def server(sock):
+            sslctx = self._create_server_ssl_context(self.ONLYCERT,
+                                                     self.ONLYKEY)
+            sock = sslctx.wrap_socket(sock, server_side=True)
+            sock.send(b'hello')
+            assert sock.recv(1024) == b'world'
+            sock.send(b'extra bytes')
+            # sending EOF here
+            sock.shutdown(socket.SHUT_WR)
+            loop.call_soon_threadsafe(eof.set)
+            # make sure we have enough time to reproduce the issue
+            assert sock.recv(1024) == b''
+            sock.close()
+
+        class Protocol(asyncio.Protocol):
+            def __init__(self):
+                self.fut = asyncio.Future(loop=loop)
+                self.transport = None
+
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def data_received(self, data):
+                if data == b'hello':
+                    self.transport.write(b'world')
+                    # pause reading would make incoming data stay in the sslobj
+                    self.transport.pause_reading()
+                else:
+                    nonlocal extra
+                    extra = data
+
+            def connection_lost(self, exc):
+                if exc is None:
+                    self.fut.set_result(None)
+                else:
+                    self.fut.set_exception(exc)
+
+        async def client(addr):
+            ctx = self._create_client_ssl_context()
+            tr, pr = await loop.create_connection(Protocol, *addr, ssl=ctx)
+            await eof.wait()
+            tr.resume_reading()
+            await pr.fut
+            tr.close()
+            assert extra == b'extra bytes'
+
+        with self.tcp_server(server) as srv:
+            loop.run_until_complete(client(srv.addr))
 
 
 class Test_UV_TCPSSL(_TestSSL, tb.UVTestCase):

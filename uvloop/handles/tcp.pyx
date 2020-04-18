@@ -1,8 +1,7 @@
 cdef __tcp_init_uv_handle(UVStream handle, Loop loop, unsigned int flags):
     cdef int err
 
-    handle._handle = <uv.uv_handle_t*> \
-                        PyMem_RawMalloc(sizeof(uv.uv_tcp_t))
+    handle._handle = <uv.uv_handle_t*>PyMem_RawMalloc(sizeof(uv.uv_tcp_t))
     if handle._handle is NULL:
         handle._abort_init()
         raise MemoryError()
@@ -58,13 +57,15 @@ cdef class TCPServer(UVStreamServer):
 
     @staticmethod
     cdef TCPServer new(Loop loop, object protocol_factory, Server server,
-                       object ssl, unsigned int flags,
+                       unsigned int flags,
+                       object backlog,
+                       object ssl,
                        object ssl_handshake_timeout,
                        object ssl_shutdown_timeout):
 
         cdef TCPServer handle
         handle = TCPServer.__new__(TCPServer)
-        handle._init(loop, protocol_factory, server,
+        handle._init(loop, protocol_factory, server, backlog,
                      ssl, ssl_handshake_timeout, ssl_shutdown_timeout)
         __tcp_init_uv_handle(<UVStream>handle, loop, flags)
         return handle
@@ -101,7 +102,7 @@ cdef class TCPTransport(UVStream):
 
     @staticmethod
     cdef TCPTransport new(Loop loop, object protocol, Server server,
-                            object waiter):
+                          object waiter):
 
         cdef TCPTransport handle
         handle = TCPTransport.__new__(TCPTransport)
@@ -115,7 +116,7 @@ cdef class TCPTransport(UVStream):
     cdef _set_nodelay(self):
         cdef int err
         self._ensure_alive()
-        err = uv.uv_tcp_nodelay(<uv.uv_tcp_t*>self._handle, 1);
+        err = uv.uv_tcp_nodelay(<uv.uv_tcp_t*>self._handle, 1)
         if err < 0:
             raise convert_error(err)
 
@@ -220,4 +221,3 @@ cdef void __tcp_connect_callback(uv.uv_connect_t* req, int status) with gil:
         wrapper.transport._fatal_error(ex, False)
     finally:
         wrapper.on_done()
-

@@ -29,7 +29,10 @@ if __name__ == '__main__':
     client_context = None
     if args.ssl:
         print('with SSL')
-        client_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        if hasattr(ssl, 'PROTOCOL_TLS'):
+            client_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        else:
+            client_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
         if hasattr(client_context, 'check_hostname'):
             client_context.check_hostname = False
         client_context.verify_mode = ssl.CERT_NONE
@@ -47,7 +50,7 @@ if __name__ == '__main__':
     MSGSIZE = args.msize
     REQSIZE = MSGSIZE * args.mpr
 
-    msg = b'x'*(MSGSIZE - 1) + b'\n'
+    msg = b'x' * (MSGSIZE - 1) + b'\n'
     if args.mpr:
         msg *= args.mpr
 
@@ -90,6 +93,6 @@ if __name__ == '__main__':
             for _ in range(N):
                 e.submit(run_test, NMESSAGES)
     end = time.time()
-    duration = end-start
+    duration = end - start
     print(NMESSAGES * N * TIMES, 'in', duration)
     print(NMESSAGES * N * TIMES / duration, 'requests/sec')

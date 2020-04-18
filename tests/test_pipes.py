@@ -69,9 +69,8 @@ class _BasePipeTest:
         rpipe, wpipe = os.pipe()
         pipeobj = io.open(rpipe, 'rb', 1024)
 
-        @asyncio.coroutine
-        def connect():
-            t, p = yield from self.loop.connect_read_pipe(
+        async def connect():
+            t, p = await self.loop.connect_read_pipe(
                 lambda: proto, pipeobj)
             self.assertIs(p, proto)
             self.assertIs(t, proto.transport)
@@ -102,10 +101,9 @@ class _BasePipeTest:
         master, slave = os.openpty()
         master_read_obj = io.open(master, 'rb', 0)
 
-        @asyncio.coroutine
-        def connect():
-            t, p = yield from self.loop.connect_read_pipe(lambda: proto,
-                                                          master_read_obj)
+        async def connect():
+            t, p = await self.loop.connect_read_pipe(
+                lambda: proto, master_read_obj)
             self.assertIs(p, proto)
             self.assertIs(t, proto.transport)
             self.assertEqual(['INITIAL', 'CONNECTED'], proto.state)
@@ -224,12 +222,12 @@ class _BasePipeTest:
             return len(data)
 
         tb.run_until(self.loop, lambda: reader(data) >= 1,
-                             timeout=10)
+                     timeout=10)
         self.assertEqual(b'1', data)
 
         transport.write(b'2345')
         tb.run_until(self.loop, lambda: reader(data) >= 5,
-                             timeout=10)
+                     timeout=10)
         self.assertEqual(b'12345', data)
         self.assertEqual('CONNECTED', proto.state)
 

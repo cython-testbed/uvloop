@@ -27,8 +27,7 @@ class _TestProcess:
                 cmd,
                 env=env,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             out, _ = await proc.communicate()
             self.assertEqual(out, b'spam\n')
@@ -46,8 +45,7 @@ class _TestProcess:
                 cwd=cwd,
                 env=env,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             out, _ = await proc.communicate()
             self.assertEqual(out, b'/\n')
@@ -66,8 +64,7 @@ class _TestProcess:
                 cwd=cwd,
                 env=env,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             out, _ = await proc.communicate()
             self.assertEqual(out, b'/\n')
@@ -87,8 +84,7 @@ class _TestProcess:
                 cmd, b'-W', b'ignore', '-c',
                 'import os,sys;sys.stdout.write(os.getenv("FRUIT"))',
                 stdout=subprocess.PIPE,
-                preexec_fn=lambda: os.putenv("FRUIT", "apple"),
-                loop=self.loop)
+                preexec_fn=lambda: os.putenv("FRUIT", "apple"))
 
             out, _ = await proc.communicate()
             self.assertEqual(out, b'apple')
@@ -106,8 +102,7 @@ class _TestProcess:
             cmd = sys.executable
             proc = await asyncio.create_subprocess_exec(
                 cmd, b'-W', b'ignore', '-c', 'import time; time.sleep(10)',
-                preexec_fn=raise_it,
-                loop=self.loop)
+                preexec_fn=raise_it)
 
             await proc.communicate()
 
@@ -133,8 +128,7 @@ class _TestProcess:
             proc = await asyncio.create_subprocess_exec(
                 b'doesnotexist', b'-W', b'ignore', b'-c', b'print("spam")',
                 executable=sys.executable,
-                stdout=subprocess.PIPE,
-                loop=self.loop)
+                stdout=subprocess.PIPE)
 
             out, err = await proc.communicate()
             self.assertEqual(out, b'spam\n')
@@ -152,8 +146,7 @@ print(os.getpid())
             proc = await asyncio.create_subprocess_exec(
                 cmd, b'-W', b'ignore', b'-c', prog,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                loop=self.loop)
+                stdout=subprocess.PIPE)
 
             pid = proc.pid
             expected_result = '{}\n'.format(pid).encode()
@@ -185,8 +178,7 @@ exit(11)
                 cmd, b'-W', b'ignore', b'-c', prog,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             proc.stdin.write(b'HELLO\n')
             await proc.stdin.drain()
@@ -224,8 +216,7 @@ while True:
                 cmd, b'-W', b'ignore', b'-c', prog,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                loop=self.loop)
+                stderr=subprocess.PIPE)
 
             self.assertGreater(proc.pid, 0)
             self.assertIs(proc.returncode, None)
@@ -267,8 +258,7 @@ print('err', file=sys.stderr, flush=True)
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, b'-W', b'ignore', b'-c', prog,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                loop=self.loop)
+                stderr=subprocess.STDOUT)
 
             out, err = await proc.communicate()
             self.assertIsNone(err)
@@ -288,8 +278,7 @@ print('err', file=sys.stderr, flush=True)
                 sys.executable, b'-W', b'ignore', b'-c', prog,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                loop=self.loop)
+                stderr=subprocess.DEVNULL)
 
             out, err = await proc.communicate()
             self.assertIsNone(err)
@@ -326,8 +315,7 @@ print("OK")
                     str(non_inherited.fileno()),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    pass_fds=(inherited.fileno(),),
-                    loop=self.loop)
+                    pass_fds=(inherited.fileno(),))
 
                 out, err = await proc.communicate()
                 self.assertEqual(err, b'')
@@ -341,12 +329,11 @@ print("OK")
                 try:
                     await asyncio.create_subprocess_exec(
                         'nonexistant',
-                        loop=self.loop,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL)
                 except FileNotFoundError:
                     pass
-                await asyncio.sleep(0, loop=self.loop)
+                await asyncio.sleep(0)
 
         self.loop.run_until_complete(main(10))
         num_fd_1 = self.get_num_fds()
@@ -361,12 +348,11 @@ print("OK")
                 try:
                     p = await asyncio.create_subprocess_exec(
                         'ls',
-                        loop=self.loop,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL)
                 finally:
                     await p.wait()
-                await asyncio.sleep(0, loop=self.loop)
+                await asyncio.sleep(0)
 
         self.loop.run_until_complete(main(10))
         num_fd_1 = self.get_num_fds()
@@ -392,19 +378,16 @@ print("OK")
             with self.assertRaises(OSError):
                 await asyncio.create_subprocess_exec(
                     'ls',
-                    loop=self.loop,
                     stdin=fd)
 
             with self.assertRaises(OSError):
                 await asyncio.create_subprocess_exec(
                     'ls',
-                    loop=self.loop,
                     stdout=fd)
 
             with self.assertRaises(OSError):
                 await asyncio.create_subprocess_exec(
                     'ls',
-                    loop=self.loop,
                     stderr=fd)
 
         self.loop.run_until_complete(main())
@@ -430,18 +413,16 @@ class _AsyncioTests:
     def test_stdin_not_inheritable(self):
         # asyncio issue #209: stdin must not be inheritable, otherwise
         # the Process.communicate() hangs
-        @asyncio.coroutine
-        def len_message(message):
+        async def len_message(message):
             code = 'import sys; data = sys.stdin.read(); print(len(data))'
-            proc = yield from asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 sys.executable, b'-W', b'ignore', b'-c', code,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                close_fds=False,
-                loop=self.loop)
-            stdout, stderr = yield from proc.communicate(message)
-            exitcode = yield from proc.wait()
+                close_fds=False)
+            stdout, stderr = await proc.communicate(message)
+            exitcode = await proc.wait()
             return (stdout, exitcode)
 
         output, exitcode = self.loop.run_until_complete(len_message(b'abc'))
@@ -451,26 +432,24 @@ class _AsyncioTests:
     def test_stdin_stdout_pipe(self):
         args = self.PROGRAM_CAT
 
-        @asyncio.coroutine
-        def run(data):
-            proc = yield from asyncio.create_subprocess_exec(
+        async def run(data):
+            proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                loop=self.loop)
+                stdout=subprocess.PIPE)
 
             # feed data
             proc.stdin.write(data)
-            yield from proc.stdin.drain()
+            await proc.stdin.drain()
             proc.stdin.close()
 
             # get output and exitcode
-            data = yield from proc.stdout.read()
-            exitcode = yield from proc.wait()
+            data = await proc.stdout.read()
+            exitcode = await proc.wait()
             return (exitcode, data)
 
         task = run(b'some data')
-        task = asyncio.wait_for(task, 60.0, loop=self.loop)
+        task = asyncio.wait_for(task, 60.0)
         exitcode, stdout = self.loop.run_until_complete(task)
         self.assertEqual(exitcode, 0)
         self.assertEqual(stdout, b'some data')
@@ -478,25 +457,23 @@ class _AsyncioTests:
     def test_stdin_stdout_file(self):
         args = self.PROGRAM_CAT
 
-        @asyncio.coroutine
-        def run(data, stdout):
-            proc = yield from asyncio.create_subprocess_exec(
+        async def run(data, stdout):
+            proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=subprocess.PIPE,
-                stdout=stdout,
-                loop=self.loop)
+                stdout=stdout)
 
             # feed data
             proc.stdin.write(data)
-            yield from proc.stdin.drain()
+            await proc.stdin.drain()
             proc.stdin.close()
 
-            exitcode = yield from proc.wait()
+            exitcode = await proc.wait()
             return exitcode
 
         with tempfile.TemporaryFile('w+b') as new_stdout:
             task = run(b'some data', new_stdout)
-            task = asyncio.wait_for(task, 60.0, loop=self.loop)
+            task = asyncio.wait_for(task, 60.0)
             exitcode = self.loop.run_until_complete(task)
             self.assertEqual(exitcode, 0)
 
@@ -506,20 +483,18 @@ class _AsyncioTests:
     def test_stdin_stderr_file(self):
         args = self.PROGRAM_ERROR
 
-        @asyncio.coroutine
-        def run(stderr):
-            proc = yield from asyncio.create_subprocess_exec(
+        async def run(stderr):
+            proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=subprocess.PIPE,
-                stderr=stderr,
-                loop=self.loop)
+                stderr=stderr)
 
-            exitcode = yield from proc.wait()
+            exitcode = await proc.wait()
             return exitcode
 
         with tempfile.TemporaryFile('w+b') as new_stderr:
             task = run(new_stderr)
-            task = asyncio.wait_for(task, 60.0, loop=self.loop)
+            task = asyncio.wait_for(task, 60.0)
             exitcode = self.loop.run_until_complete(task)
             self.assertEqual(exitcode, 1)
 
@@ -529,18 +504,16 @@ class _AsyncioTests:
     def test_communicate(self):
         args = self.PROGRAM_CAT
 
-        @asyncio.coroutine
-        def run(data):
-            proc = yield from asyncio.create_subprocess_exec(
+        async def run(data):
+            proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                loop=self.loop)
-            stdout, stderr = yield from proc.communicate(data)
+                stdout=subprocess.PIPE)
+            stdout, stderr = await proc.communicate(data)
             return proc.returncode, stdout
 
         task = run(b'some data')
-        task = asyncio.wait_for(task, 60.0, loop=self.loop)
+        task = asyncio.wait_for(task, 60.0)
         exitcode, stdout = self.loop.run_until_complete(task)
         self.assertEqual(exitcode, 0)
         self.assertEqual(stdout, b'some data')
@@ -548,22 +521,20 @@ class _AsyncioTests:
     def test_start_new_session(self):
         # start the new process in a new session
         create = asyncio.create_subprocess_shell('exit 8',
-                                                 start_new_session=True,
-                                                 loop=self.loop)
+                                                 start_new_session=True)
         proc = self.loop.run_until_complete(create)
         exitcode = self.loop.run_until_complete(proc.wait())
         self.assertEqual(exitcode, 8)
 
     def test_shell(self):
-        create = asyncio.create_subprocess_shell('exit 7',
-                                                 loop=self.loop)
+        create = asyncio.create_subprocess_shell('exit 7')
         proc = self.loop.run_until_complete(create)
         exitcode = self.loop.run_until_complete(proc.wait())
         self.assertEqual(exitcode, 7)
 
     def test_kill(self):
         args = self.PROGRAM_BLOCKED
-        create = asyncio.create_subprocess_exec(*args, loop=self.loop)
+        create = asyncio.create_subprocess_exec(*args)
         proc = self.loop.run_until_complete(create)
         proc.kill()
         returncode = self.loop.run_until_complete(proc.wait())
@@ -571,7 +542,7 @@ class _AsyncioTests:
 
     def test_terminate(self):
         args = self.PROGRAM_BLOCKED
-        create = asyncio.create_subprocess_exec(*args, loop=self.loop)
+        create = asyncio.create_subprocess_exec(*args)
         proc = self.loop.run_until_complete(create)
         proc.terminate()
         returncode = self.loop.run_until_complete(proc.wait())
@@ -581,18 +552,16 @@ class _AsyncioTests:
         code = 'import time; print("sleeping", flush=True); time.sleep(3600)'
         args = [sys.executable, b'-W', b'ignore', b'-c', code]
         create = asyncio.create_subprocess_exec(*args,
-                                                stdout=subprocess.PIPE,
-                                                loop=self.loop)
+                                                stdout=subprocess.PIPE)
         proc = self.loop.run_until_complete(create)
 
-        @asyncio.coroutine
-        def send_signal(proc):
+        async def send_signal(proc):
             # basic synchronization to wait until the program is sleeping
-            line = yield from proc.stdout.readline()
+            line = await proc.stdout.readline()
             self.assertEqual(line, b'sleeping\n')
 
             proc.send_signal(signal.SIGHUP)
-            returncode = (yield from proc.wait())
+            returncode = (await proc.wait())
             return returncode
 
         returncode = self.loop.run_until_complete(send_signal(proc))
@@ -601,17 +570,15 @@ class _AsyncioTests:
     def test_cancel_process_wait(self):
         # Issue #23140: cancel Process.wait()
 
-        @asyncio.coroutine
-        def cancel_wait():
-            proc = yield from asyncio.create_subprocess_exec(
-                *self.PROGRAM_BLOCKED,
-                loop=self.loop)
+        async def cancel_wait():
+            proc = await asyncio.create_subprocess_exec(
+                *self.PROGRAM_BLOCKED)
 
             # Create an internal future waiting on the process exit
             task = self.loop.create_task(proc.wait())
             self.loop.call_soon(task.cancel)
             try:
-                yield from task
+                await task
             except asyncio.CancelledError:
                 pass
 
@@ -620,25 +587,23 @@ class _AsyncioTests:
 
             # Kill the process and wait until it is done
             proc.kill()
-            yield from proc.wait()
+            await proc.wait()
 
         self.loop.run_until_complete(cancel_wait())
 
     def test_cancel_make_subprocess_transport_exec(self):
-        @asyncio.coroutine
-        def cancel_make_transport():
-            coro = asyncio.create_subprocess_exec(*self.PROGRAM_BLOCKED,
-                                                  loop=self.loop)
+        async def cancel_make_transport():
+            coro = asyncio.create_subprocess_exec(*self.PROGRAM_BLOCKED)
             task = self.loop.create_task(coro)
 
             self.loop.call_soon(task.cancel)
             try:
-                yield from task
+                await task
             except asyncio.CancelledError:
                 pass
 
             # Give the process handler some time to close itself
-            yield from asyncio.sleep(0.3, loop=self.loop)
+            await asyncio.sleep(0.3)
             gc.collect()
 
         # ignore the log:
@@ -647,20 +612,19 @@ class _AsyncioTests:
             self.loop.run_until_complete(cancel_make_transport())
 
     def test_cancel_post_init(self):
-        @asyncio.coroutine
-        def cancel_make_transport():
+        async def cancel_make_transport():
             coro = self.loop.subprocess_exec(asyncio.SubprocessProtocol,
                                              *self.PROGRAM_BLOCKED)
             task = self.loop.create_task(coro)
 
             self.loop.call_soon(task.cancel)
             try:
-                yield from task
+                await task
             except asyncio.CancelledError:
                 pass
 
             # Give the process handler some time to close itself
-            yield from asyncio.sleep(0.3, loop=self.loop)
+            await asyncio.sleep(0.3)
             gc.collect()
 
         # ignore the log:
@@ -681,14 +645,13 @@ class _AsyncioTests:
             def connection_lost(self, exc):
                 self.closed.set_result(1)
 
-        @asyncio.coroutine
-        def test_subprocess():
-            transport, protocol = yield from loop.subprocess_exec(
+        async def test_subprocess():
+            transport, protocol = await loop.subprocess_exec(
                 Protocol, *self.PROGRAM_BLOCKED)
             pid = transport.get_pid()
             transport.close()
             self.assertIsNone(transport.get_returncode())
-            yield from protocol.closed
+            await protocol.closed
             self.assertIsNotNone(transport.get_returncode())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
@@ -709,8 +672,7 @@ print('err', file=sys.stderr, flush=True)
             '''
 
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, b'-W', b'ignore', b'-c', prog,
-                loop=self.loop)
+                sys.executable, b'-W', b'ignore', b'-c', prog)
 
             out, err = await proc.communicate()
             self.assertIsNone(out)

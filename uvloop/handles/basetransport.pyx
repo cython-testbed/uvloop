@@ -40,15 +40,14 @@ cdef class UVBaseTransport(UVSocketHandle):
 
         self._force_close(exc)
 
-        if not isinstance(exc, FATAL_SSL_ERROR_IGNORE):
+        if not isinstance(exc, OSError):
 
             if throw or self._loop is None:
                 raise exc
 
-            msg = 'Fatal error on transport {}'.format(
-                    self.__class__.__name__)
+            msg = f'Fatal error on transport {self.__class__.__name__}'
             if reason is not None:
-                msg = '{} ({})'.format(msg, reason)
+                msg = f'{msg} ({reason})'
 
             self._loop.call_exception_handler({
                 'message': msg,
@@ -68,7 +67,9 @@ cdef class UVBaseTransport(UVSocketHandle):
             self._protocol_paused = 1
             try:
                 self._protocol.pause_writing()
-            except Exception as exc:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
                 self._loop.call_exception_handler({
                     'message': 'protocol.pause_writing() failed',
                     'exception': exc,
@@ -84,7 +85,9 @@ cdef class UVBaseTransport(UVSocketHandle):
             self._protocol_paused = 0
             try:
                 self._protocol.resume_writing()
-            except Exception as exc:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
                 self._loop.call_exception_handler({
                     'message': 'protocol.resume_writing() failed',
                     'exception': exc,
@@ -126,7 +129,7 @@ cdef class UVBaseTransport(UVSocketHandle):
 
         try:
             self._protocol.connection_made(self)
-        except:
+        except BaseException:
             self._wakeup_waiter()
             raise
 
@@ -141,11 +144,6 @@ cdef class UVBaseTransport(UVSocketHandle):
 
     cdef _call_connection_lost(self, exc):
         if self._waiter is not None:
-            # This shouldn't ever happen!
-            self._loop.call_exception_handler({
-                'message': 'waiter is not None in {}._call_connection_lost'.
-                    format(self.__class__.__name__)
-            })
             if not self._waiter.done():
                 self._waiter.set_exception(exc)
             self._waiter = None
@@ -175,8 +173,7 @@ cdef class UVBaseTransport(UVSocketHandle):
     cdef inline _set_waiter(self, object waiter):
         if waiter is not None and not isfuture(waiter):
             raise TypeError(
-                'invalid waiter object {!r}, expected asyncio.Future'.
-                    format(waiter))
+                f'invalid waiter object {waiter!r}, expected asyncio.Future')
 
         self._waiter = waiter
 

@@ -1,3 +1,6 @@
+# flake8: noqa
+
+
 import asyncio, asyncio.log, asyncio.base_events, \
        asyncio.sslproto, asyncio.coroutines, \
        asyncio.futures, asyncio.transports
@@ -63,6 +66,8 @@ cdef gc_disable = gc.disable
 cdef iter_chain = itertools.chain
 cdef inspect_isgenerator = inspect.isgenerator
 
+cdef int has_IPV6_V6ONLY = hasattr(socket, 'IPV6_V6ONLY')
+cdef int IPV6_V6ONLY = getattr(socket, 'IPV6_V6ONLY', -1)
 cdef int has_SO_REUSEPORT = hasattr(socket, 'SO_REUSEPORT')
 cdef int SO_REUSEPORT = getattr(socket, 'SO_REUSEPORT', 0)
 cdef int SO_BROADCAST = getattr(socket, 'SO_BROADCAST')
@@ -111,10 +116,12 @@ cdef stat_S_ISSOCK = stat.S_ISSOCK
 
 cdef sys_ignore_environment = sys.flags.ignore_environment
 cdef sys_exc_info = sys.exc_info
-cdef sys_set_coroutine_wrapper = sys.set_coroutine_wrapper
-cdef sys_get_coroutine_wrapper = sys.get_coroutine_wrapper
+cdef sys_set_coroutine_wrapper = getattr(sys, 'set_coroutine_wrapper', None)
+cdef sys_get_coroutine_wrapper = getattr(sys, 'get_coroutine_wrapper', None)
 cdef sys_getframe = sys._getframe
 cdef sys_version_info = sys.version_info
+cdef sys_getfilesystemencoding = sys.getfilesystemencoding
+cdef str sys_platform = sys.platform
 
 cdef ssl_SSLContext = ssl.SSLContext
 cdef ssl_MemoryBIO = ssl.MemoryBIO
@@ -125,13 +132,6 @@ cdef ssl_CertificateError = ssl.CertificateError
 cdef int ssl_SSL_ERROR_WANT_READ = ssl.SSL_ERROR_WANT_READ
 cdef int ssl_SSL_ERROR_WANT_WRITE = ssl.SSL_ERROR_WANT_WRITE
 cdef int ssl_SSL_ERROR_SYSCALL = ssl.SSL_ERROR_SYSCALL
-
-cdef FATAL_SSL_ERROR_IGNORE = (
-    BrokenPipeError,
-    ConnectionResetError,
-    ConnectionAbortedError,
-    ssl.CertificateError,
-)
 
 cdef uint64_t MAIN_THREAD_ID = <uint64_t><int64_t>threading.main_thread().ident
 

@@ -1,8 +1,7 @@
 cdef __pipe_init_uv_handle(UVStream handle, Loop loop):
     cdef int err
 
-    handle._handle = <uv.uv_handle_t*> \
-                        PyMem_RawMalloc(sizeof(uv.uv_pipe_t))
+    handle._handle = <uv.uv_handle_t*>PyMem_RawMalloc(sizeof(uv.uv_pipe_t))
     if handle._handle is NULL:
         handle._abort_init()
         raise MemoryError()
@@ -39,13 +38,14 @@ cdef class UnixServer(UVStreamServer):
 
     @staticmethod
     cdef UnixServer new(Loop loop, object protocol_factory, Server server,
+                        object backlog,
                         object ssl,
                         object ssl_handshake_timeout,
                         object ssl_shutdown_timeout):
 
         cdef UnixServer handle
         handle = UnixServer.__new__(UnixServer)
-        handle._init(loop, protocol_factory, server,
+        handle._init(loop, protocol_factory, server, backlog,
                      ssl, ssl_handshake_timeout, ssl_shutdown_timeout)
         __pipe_init_uv_handle(<UVStream>handle, loop)
         return handle
@@ -81,7 +81,7 @@ cdef class UnixTransport(UVStream):
 
     @staticmethod
     cdef UnixTransport new(Loop loop, object protocol, Server server,
-                             object waiter):
+                           object waiter):
 
         cdef UnixTransport handle
         handle = UnixTransport.__new__(UnixTransport)
@@ -106,7 +106,7 @@ cdef class ReadUnixTransport(UVStream):
 
     @staticmethod
     cdef ReadUnixTransport new(Loop loop, object protocol, Server server,
-                                 object waiter):
+                               object waiter):
         cdef ReadUnixTransport handle
         handle = ReadUnixTransport.__new__(ReadUnixTransport)
         handle._init(loop, protocol, server, waiter)
@@ -147,9 +147,13 @@ cdef class ReadUnixTransport(UVStream):
 @cython.no_gc_clear
 cdef class WriteUnixTransport(UVStream):
 
+    def __cinit__(self):
+        self.disconnect_listener_inited = False
+        self.disconnect_listener.data = NULL
+
     @staticmethod
     cdef WriteUnixTransport new(Loop loop, object protocol, Server server,
-                                  object waiter):
+                                object waiter):
         cdef WriteUnixTransport handle
         handle = WriteUnixTransport.__new__(WriteUnixTransport)
 
@@ -163,6 +167,46 @@ cdef class WriteUnixTransport(UVStream):
         __pipe_init_uv_handle(<UVStream>handle, loop)
         return handle
 
+    cdef _start_reading(self):
+        # A custom implementation for monitoring for EOF:
+        # libuv since v1.23.1 prohibits using uv_read_start on
+        # write-only FDs, so we use a throw-away uv_poll_t handle
+        # for that purpose, as suggested in
+        # https://github.com/libuv/libuv/issues/2058.
+
+        cdef int err
+
+        if not self.disconnect_listener_inited:
+            err = uv.uv_poll_init(self._loop.uvloop,
+                                  &self.disconnect_listener,
+                                  self._fileno())
+            if err < 0:
+                raise convert_error(err)
+            self.disconnect_listener.data = <void*>self
+            self.disconnect_listener_inited = True
+
+        err = uv.uv_poll_start(&self.disconnect_listener,
+                               uv.UV_READABLE | uv.UV_DISCONNECT,
+                               __on_write_pipe_poll_event)
+        if err < 0:
+            raise convert_error(err)
+
+    cdef _stop_reading(self):
+        cdef int err
+        if not self.disconnect_listener_inited:
+            return
+        err = uv.uv_poll_stop(&self.disconnect_listener)
+        if err < 0:
+            raise convert_error(err)
+
+    cdef _close(self):
+        if self.disconnect_listener_inited:
+            self.disconnect_listener.data = NULL
+            uv.uv_close(<uv.uv_handle_t *>(&self.disconnect_listener), NULL)
+            self.disconnect_listener_inited = False
+
+        UVStream._close(self)
+
     cdef _new_socket(self):
         return __pipe_get_socket(<UVSocketHandle>self)
 
@@ -174,6 +218,25 @@ cdef class WriteUnixTransport(UVStream):
 
     def resume_reading(self):
         raise NotImplementedError
+
+
+cdef void __on_write_pipe_poll_event(uv.uv_poll_t* handle,
+                                     int status, int events) with gil:
+    cdef WriteUnixTransport tr
+
+    if handle.data is NULL:
+        return
+
+    tr = <WriteUnixTransport>handle.data
+    if tr._closed:
+        return
+
+    if events & uv.UV_DISCONNECT:
+        try:
+            tr._stop_reading()
+            tr._on_eof()
+        except BaseException as ex:
+            tr._fatal_error(ex, False)
 
 
 cdef class _PipeConnectRequest(UVRequest):
@@ -212,4 +275,3 @@ cdef void __pipe_connect_callback(uv.uv_connect_t* req, int status) with gil:
         wrapper.transport._fatal_error(ex, False)
     finally:
         wrapper.on_done()
-

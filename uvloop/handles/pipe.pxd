@@ -4,6 +4,7 @@ cdef class UnixServer(UVStreamServer):
 
     @staticmethod
     cdef UnixServer new(Loop loop, object protocol_factory, Server server,
+                        object backlog,
                         object ssl,
                         object ssl_handshake_timeout,
                         object ssl_shutdown_timeout)
@@ -26,6 +27,10 @@ cdef class ReadUnixTransport(UVStream):
 
 
 cdef class WriteUnixTransport(UVStream):
+
+    cdef:
+        uv.uv_poll_t disconnect_listener
+        bint disconnect_listener_inited
 
     @staticmethod
     cdef WriteUnixTransport new(Loop loop, object protocol, Server server,

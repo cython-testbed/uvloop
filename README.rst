@@ -4,6 +4,10 @@
 .. image:: https://img.shields.io/pypi/v/uvloop.svg
     :target: https://pypi.python.org/pypi/uvloop
 
+.. image:: https://pepy.tech/badge/uvloop
+    :target: https://pepy.tech/project/uvloop
+    :alt: PyPI - Downloads
+
 
 uvloop is a fast, drop-in replacement of the built-in asyncio
 event loop.  uvloop is implemented in Cython and uses libuv
@@ -40,19 +44,29 @@ Use pip to install it::
 
     $ pip install uvloop
 
+Note that it is highly recommended to **upgrade pip before** installing
+uvloop with::
+
+    $ pip install -U pip
+
 
 Using uvloop
 ------------
 
-To make asyncio use uvloop, you can install the uvloop event
-loop policy:
+Call ``uvloop.install()`` before calling ``asyncio.run()`` or
+manually creating an asyncio event loop:
 
 .. code:: python
 
     import asyncio
     import uvloop
 
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    async def main():
+        # Main entry-point.
+        ...
+
+    uvloop.install()
+    asyncio.run(main())
 
 
 Building From Source
@@ -67,7 +81,7 @@ To build uvloop, you'll need Python 3.5 or greater:
     $ git clone --recursive git@github.com:MagicStack/uvloop.git
     $ cd uvloop
 
-2. Create a virtual environment and activate it, for example:
+2. Create a virtual environment and activate it:
 
    .. code::
 
@@ -84,7 +98,8 @@ To build uvloop, you'll need Python 3.5 or greater:
 
    .. code::
 
-    $ make && make test
+    $ make
+    $ make test
 
 
 License
