@@ -284,6 +284,91 @@ class _TestUDP:
 
         self.loop.run_until_complete(run())
 
+    def test_socketpair(self):
+        peername = asyncio.Future(loop=self.loop)
+
+        class Proto(MyDatagramProto):
+            def datagram_received(self, data, addr):
+                super().datagram_received(data, addr)
+                peername.set_result(addr)
+
+        s1, s2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM, 0)
+
+        with s1, s2:
+            try:
+                f = self.loop.create_datagram_endpoint(
+                    lambda: Proto(loop=self.loop), sock=s1)
+            except TypeError as ex:
+                # asyncio in 3.5.0 doesn't have the 'sock' argument
+                if 'got an unexpected keyword argument' not in ex.args[0]:
+                    raise
+            else:
+                tr, pr = self.loop.run_until_complete(f)
+                self.assertIsInstance(pr, Proto)
+
+                s2.send(b'hello, socketpair')
+                addr = self.loop.run_until_complete(
+                    asyncio.wait_for(peername, 1, loop=self.loop))
+                if sys.platform.startswith('linux'):
+                    self.assertEqual(addr, None)
+                else:
+                    self.assertEqual(addr, '')
+                self.assertEqual(pr.nbytes, 17)
+
+                if not self.is_asyncio_loop():
+                    # asyncio doesn't support sendto(xx) on UDP sockets
+                    # https://git.io/Jfqbw
+                    data = b'from uvloop'
+                    tr.sendto(data)
+                    result = self.loop.run_until_complete(asyncio.wait_for(
+                        self.loop.run_in_executor(None, s2.recv, 1024),
+                        1, loop=self.loop))
+                    self.assertEqual(data, result)
+
+                tr.close()
+                self.loop.run_until_complete(pr.done)
+
+    def _skip_create_datagram_endpoint_reuse_addr(self):
+        if self.implementation == 'asyncio':
+            if sys.version_info[:2] >= (3, 11):
+                raise unittest.SkipTest()
+            if (3, 8, 0) <= sys.version_info < (3, 8, 1):
+                raise unittest.SkipTest()
+            if (3, 7, 0) <= sys.version_info < (3, 7, 6):
+                raise unittest.SkipTest()
+            if sys.version_info < (3, 6, 10):
+                raise unittest.SkipTest()
+
+    def test_create_datagram_endpoint_reuse_address_error(self):
+        # bpo-37228: Ensure that explicit passing of `reuse_address=True`
+        # raises an error, as it is not safe to use SO_REUSEADDR when using UDP
+
+        self._skip_create_datagram_endpoint_reuse_addr()
+
+        coro = self.loop.create_datagram_endpoint(
+            lambda: MyDatagramProto(loop=self.loop),
+            local_addr=('127.0.0.1', 0),
+            reuse_address=True)
+
+        with self.assertRaises(ValueError):
+            self.loop.run_until_complete(coro)
+
+    def test_create_datagram_endpoint_reuse_address_warning(self):
+        # bpo-37228: Deprecate *reuse_address* parameter
+
+        self._skip_create_datagram_endpoint_reuse_addr()
+
+        coro = self.loop.create_datagram_endpoint(
+            lambda: MyDatagramProto(loop=self.loop),
+            local_addr=('127.0.0.1', 0),
+            reuse_address=False)
+
+        with self.assertWarns(DeprecationWarning):
+            tr, pr = self.loop.run_until_complete(coro)
+
+        tr.close()
+        self.loop.run_until_complete(pr.done)
+
 
 class Test_UV_UDP(_TestUDP, tb.UVTestCase):
 
